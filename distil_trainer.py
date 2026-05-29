@@ -12,32 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-import json
 import os
-import textwrap
-from collections import defaultdict, deque
-from contextlib import nullcontext
-from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Optional, Union
-import random
-
-import datasets
+import json
 import torch
 import torch.utils.data
+import random
+import inspect
+import datasets
 import transformers
+
+from pathlib import Path
+from functools import partial
+from typing import Any, Callable, Optional, Union
+from collections import defaultdict, deque
+
 from accelerate import logging
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from accelerate.utils import gather, gather_object, is_peft_model, set_seed
+
 from datasets import Dataset, IterableDataset
+
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
+from torch.nn.functional import log_softmax, kl_div
+
 from transformers import (
     AutoConfig,
-    AutoModelForSequenceClassification,
     AutoProcessor,
-    AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -50,22 +50,15 @@ from transformers.utils import is_datasets_available, is_flash_attn_2_available,
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, prepare_multimodal_messages
 from trl.extras.profiling import profiling_context, profiling_decorator
-
-
-from trl.models import prepare_deepspeed, prepare_fsdp, prepare_peft_model, unwrap_model_for_generation
-from trl.models.utils import _ForwardRedirection
+from trl.models import prepare_peft_model, unwrap_model_for_generation
 from trl.trainer.base_trainer import BaseTrainer
-from SafeSteer.distil_config import DistilConfig
-from accelerate.state import AcceleratorState
 from trl.trainer.utils import (
     RepeatSampler,
     disable_dropout_in_model,
-    ensure_master_addr_port,
     entropy_from_logits,
     identity,
     nanmax,
     nanmin,
-    nanstd,
     pad,
     print_prompt_completions_sample,
     selective_log_softmax,
@@ -74,29 +67,20 @@ from trl.trainer.utils import (
     split_tensor_dict,
     unsplit_pixel_values_by_grid,
 )
-from torch.nn.functional import log_softmax, kl_div
-
-if is_peft_available():
-    from peft import PeftConfig, PeftModel
-
-
-
-
-if is_wandb_available():
-    import wandb
-
-
-logger = logging.get_logger(__name__)
-
-
-from transformers import TrainerCallback
-import torch
 
 from model_utils.model_factory import construct_model_base
 from utils.refusal_direction_utils import load_dataset_split, filter_data, select_and_save_direction, generate_and_save_candidate_directions
 from utils.select_safe_tokens_via_activation import get_safe_tokens
 from utils.select_safe_tokens_via_prompt import get_safe_tokens_via_prompt
+from distil_config import DistilConfig
 
+if is_peft_available():
+    from peft import PeftConfig, PeftModel
+
+if is_wandb_available():
+    import wandb
+
+logger = logging.get_logger(__name__)
 
 def _dump_safe_tokens_trace(output_dir, step, horizon, token_ids, scores, tokenizer,
                             prob_baseline=None, prob_steered=None, is_main_process=True):
@@ -157,7 +141,7 @@ class DynamicRefusalVectorCallback(TrainerCallback):
         self.harmful_val = harmful_val
         self.harmless_val = harmless_val
 
-        # Unwrap the reference model from the accelerator (handles DDP/FSDP wrapping)
+        # Unwrap the reference model from the accelerator (handles DDP wrapping)
         unwrapped_ref_model = self.trainer.accelerator.unwrap_model(self.trainer.ref_model)
 
         # Build a ModelBase wrapper around the reference model for direction extraction
@@ -244,7 +228,7 @@ class DynamicSafeTokenViaRefusalVectorCallback(TrainerCallback):
         self.harmful_val = harmful_val
         self.harmless_val = harmless_val
 
-        # Unwrap the reference model (handles DDP/FSDP wrapping)
+        # Unwrap the reference model (handles DDP wrapping)
         unwrapped_ref_model = self.trainer.accelerator.unwrap_model(self.trainer.ref_model)
         # Build the ModelBase adapter once; the underlying ref_model is mutated in place
         # by the sync callback, so this adapter automatically sees fresh weights.
@@ -403,8 +387,7 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
     
     Unlike the default SyncRefModelCallback, this version iterates through parameters
     one at a time instead of gathering all parameters at once. This reduces peak memory
-    usage from O(full_model_size) to O(single_param_size), making it feasible to sync
-    large models with DeepSpeed ZeRO-3.
+    usage from O(full_model_size) to O(single_param_size).
     """
 
     def __init__(
@@ -429,28 +412,10 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
         
         This is O(1) in memory overhead instead of O(N) where N is model size.
         """
-        deepspeed_plugin = AcceleratorState().deepspeed_plugin
-        is_zero3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-        
-        if is_zero3:
-            import deepspeed
-            
-            # Iterate through parameters one at a time
-            for (name, model_param), (_, ref_param) in zip(
-                model.named_parameters(), target_model.named_parameters()
-            ):
-                # Gather only this pair of parameters
-                with deepspeed.zero.GatheredParameters(
-                    [model_param, ref_param], modifier_rank=0
-                ):
-                    if deepspeed.comm.get_rank() == 0:
-                        MemoryEfficientSyncRefModelCallback._sync_param(
-                            model_param, ref_param, alpha
-                        )
-        else:
-            # Non-ZeRO-3: just iterate normally
-            for model_param, ref_param in zip(model.parameters(), target_model.parameters()):
-                MemoryEfficientSyncRefModelCallback._sync_param(model_param, ref_param, alpha)
+
+        # Non-ZeRO-3: just iterate normally
+        for model_param, ref_param in zip(model.parameters(), target_model.parameters()):
+            MemoryEfficientSyncRefModelCallback._sync_param(model_param, ref_param, alpha)
 
     def on_step_end(self, args, state, control, **kwargs):
         model: PreTrainedModel = kwargs["model"]
@@ -570,16 +535,21 @@ class DistilTrainer(BaseTrainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
-        # Args
+        # =====================================================================
+        # 1. Resolve args + load Student model
+        # =====================================================================
+
+        # 1.1 Default config if not provided.
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
             args = DistilConfig(f"{model_name}-Distil")
 
-        # Models
-        # Trained model
-        model_init_kwargs = args.model_init_kwargs or {} # SafeSteer✅ ours is empty
-        if isinstance(model, str): # SafeSteer✅ ours is not str
+        # 1.2 Materialize the Student model.
+        # ✅ SafeSteer setup always passes a pre-loaded PreTrainedModel, so the
+        # `isinstance(model, str)` branch never fires and model_init_kwargs is empty.
+        model_init_kwargs = args.model_init_kwargs or {}
+        if isinstance(model, str):
             model_id = model
             dtype = model_init_kwargs.get("dtype")
             if isinstance(dtype, torch.dtype) or dtype == "auto" or dtype is None:
@@ -604,22 +574,30 @@ class DistilTrainer(BaseTrainer):
                     "The `model_init_kwargs` will be ignored."
                 )
 
-        # Some models (SmolVLM/Idefics3) don't support `logits_to_keep` argument and error out if we pass it
-        # Inspect the forward method before we wrap the model with PEFT
-        self.model_kwarg_keys = ( # SafeSteer✅ get the parameters that the model's forward function can accept
+        # 1.3 Cache the kwarg names that model.forward() accepts.
+        # Used downstream to decide whether we can pass `logits_to_keep`
+        # (some VLMs like SmolVLM/Idefics3 don't support it).
+        self.model_kwarg_keys = (
             inspect.signature(model.forward).parameters.keys()
             if not hasattr(model, "get_base_model")
             else inspect.signature(model.get_base_model().forward).parameters.keys()
         )
 
-        if peft_config is not None or (is_peft_available() and isinstance(model, PeftModel)): # SafeSteer✅ it will not be performed, as we are not using LoRA
+        # 1.4 PEFT/LoRA wrapping (no-op in ✅ SafeSteer setup: peft_config is None and
+        # model is not a PeftModel).
+        if peft_config is not None or (is_peft_available() and isinstance(model, PeftModel)):
             model = prepare_peft_model(model, peft_config, args)
 
-        # Processing class
-        if processing_class is None: # SafeSteer✅ Ours is not None
-            processing_class = AutoProcessor.from_pretrained(model.config._name_or_path, truncation_side="left") 
+        # =====================================================================
+        # 2. Tokenizer + pad/eos tokens
+        # =====================================================================
 
-        # Handle pad token for processors or tokenizers
+        # 2.1 Auto-load a processor if none was passed.
+        # ✅ SafeSteer setup always passes a tokenizer, so this branch never fires.
+        if processing_class is None:
+            processing_class = AutoProcessor.from_pretrained(model.config._name_or_path, truncation_side="left")
+
+        # 2.2 Extract the underlying tokenizer from either a Processor or a Tokenizer.
         if isinstance(processing_class, ProcessorMixin):
             tokenizer = processing_class.tokenizer
         elif isinstance(processing_class, PreTrainedTokenizerBase):
@@ -627,6 +605,7 @@ class DistilTrainer(BaseTrainer):
         else:
             raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
 
+        # 2.3 Fall back pad_token to eos_token (common for Qwen / Llama families).
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -634,7 +613,9 @@ class DistilTrainer(BaseTrainer):
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
 
-        # Training arguments
+        # =====================================================================
+        # 3. Copy training hyperparameters from args
+        # =====================================================================
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length
         self.num_generations = args.num_generations
@@ -644,12 +625,6 @@ class DistilTrainer(BaseTrainer):
         self.min_p = args.min_p
         self.repetition_penalty = args.repetition_penalty
         self.use_transformers_paged = args.use_transformers_paged
-        self.use_vllm = args.use_vllm
-        self.vllm_mode = args.vllm_mode
-        self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
-        self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
-        self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
-        self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
@@ -658,9 +633,12 @@ class DistilTrainer(BaseTrainer):
         self.num_loss_tokens_to_skip = args.num_loss_tokens_to_skip
         self.num_loss_tokens_to_keep = args.num_loss_tokens_to_keep
 
-        # Datasets
+        # =====================================================================
+        # 4. Dataset validation
+        # =====================================================================
         self.shuffle_dataset = args.shuffle_dataset
 
+        # IterableDataset is not supported (see https://github.com/huggingface/trl/issues/3213).
         if (
             isinstance(train_dataset, IterableDataset)
             or isinstance(eval_dataset, IterableDataset)
@@ -668,27 +646,31 @@ class DistilTrainer(BaseTrainer):
                 isinstance(eval_dataset, dict) and any(isinstance(ds, IterableDataset) for ds in eval_dataset.values())
             )
         ):
-            # See https://github.com/huggingface/trl/issues/3213
             raise NotImplementedError(
                 "Iterable datasets are not yet supported in DistilTrainer. Please use a standard dataset instead."
             )
 
-        # Multi-step
+        # =====================================================================
+        # 5. Multi-iteration sampling state
+        # =====================================================================
         self.num_iterations = args.num_iterations
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
-        # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
+        # Counts forward+backward passes, including those inside one grad-accum cycle.
         self._step = 0
-        # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
-        # `_get_train_sampler` and `_prepare_inputs`.
+        # Cache the generation outputs so multiple updates can reuse them.
+        # See `_get_train_sampler` and `_prepare_inputs` for the read sites.
         self._buffered_inputs = None
 
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in GRPO-like algorithms, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
-        # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
-        # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
-        # This acts as a flag to indicate that the warning has already been issued.
+        # =====================================================================
+        # 6. Call parent Trainer
+        # =====================================================================
+
+        # Suppress the "could not estimate FLOPs" warning. The parent Trainer                                                                                                                                                                                                                                                                                                                                    
+        # counts elements of "input_ids" to compute throughput, but ✅ SafeSteer batches
+        # carry text fields ("prompt") instead. Marking the                                                                                                                                                                                                                                                                                                                                       
+        # warning as already-issued silences it; FLOPs metric is unaffected
+        # either way.
         model.warnings_issued["estimate_tokens"] = True
 
         super().__init__(
@@ -700,47 +682,43 @@ class DistilTrainer(BaseTrainer):
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
-            # In Trainer, `training_step` scales the loss by `gradient_accumulation_steps` only if `compute_loss_func`
-            # is None. For DAPO, loss scaling instead depends on the total number of completions tokens across the
-            # global accumulated batch. To control scaling ourselves, we must disable Trainer’s built-in scaling. The
-            # simplest (though a bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses
-            # that behavior without rewriting `training_step`.
+            # `compute_loss_func` is set to a non-None placeholder so the parent's
+            # `training_step` skips its built-in gradient-accumulation scaling.
+            # We scale ourselves based on total completion tokens in the global
+            # accumulated batch (DAPO-style). Any non-None value works.
             compute_loss_func="non-None value to disable scaling",
         )
 
-        # Reference model
+        # =====================================================================
+        # 7. Reference (Teacher) model
+        # =====================================================================
         self.beta = args.beta
         self.alpha = args.alpha
-        self.generate_from_teacher = args.generate_from_teacher
-        if ref_model is not None: # SafeSteer✅ Ours is not None
-            # If a reference model is provided, use it
-            self.ref_model = ref_model
-        elif self.beta == 0.0:
-            # If beta is 0.0, the reference model is not needed
-            self.ref_model = None
-        elif is_peft_model(model):
-            # If PEFT is used, the reference model is not needed since the adapter can be disabled
-            # to revert to the initial model.
-            self.ref_model = None
-        else:
-            # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
-            config = AutoConfig.from_pretrained(model_id)
-            architecture = getattr(transformers, config.architectures[0])
-            self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
 
-        # Disable dropout in the models
-        if args.disable_dropout: # SafeSteer✅ ours is false
+        # ✅ SafeSteer setup always passes a non-None ref_model, so the first branch fires.
+        if ref_model is not None:
+            self.ref_model = ref_model
+        else:
+            raise ValueError("DistilTrainer requires a reference model for self-distillation. Please provide one via the `ref_model` argument.")
+
+        # =====================================================================
+        # 8. Disable dropout in models (no-op in ✅ SafeSteer setup)
+        # =====================================================================
+        if args.disable_dropout:
             disable_dropout_in_model(model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
 
-        # Initialize the metrics
+        # =====================================================================
+        # 9. Metrics + log buffers
+        # =====================================================================
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
-        # Keep logs sized to the generation batch to record only outputs from the latest model update.
+
+        # Bounded deques so we only retain entries from the latest generation batch.
         self._logs = {
             "images": deque(maxlen=args.generation_batch_size),
             "prompt": deque(maxlen=args.generation_batch_size),
@@ -751,130 +729,51 @@ class DistilTrainer(BaseTrainer):
             "advantages": deque(maxlen=args.generation_batch_size),
         }
 
-        # Ensure each process receives a unique seed to prevent duplicate completions when generating with
-        # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
-        # it's safer to set it in all cases.
+        # =====================================================================
+        # 10. Seeds + generation config
+        # =====================================================================
+
+        # Per-process seed so different ranks generate different completions
+        # when num_generations > per_device_train_batch_size.
         set_seed(args.seed, device_specific=True)
 
-        # SafeSteer✅ we are not using this, because vLLM does not support adding hooks to the teacher model, which is essential for our refusal direction extraction process
-        if self.use_vllm:
-            if not is_vllm_available():
-                raise ImportError(
-                    "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
-                    "`pip install trl[vllm]` to use it."
-                )
-
-            if self.vllm_mode == "server":
-                if self.accelerator.is_main_process:
-                    if args.vllm_server_base_url is not None:
-                        base_url = args.vllm_server_base_url
-                    else:
-                        base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
-                    self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
-                    self.vllm_client.init_communicator(device=torch.cuda.current_device())
-
-            elif self.vllm_mode == "colocate":
-                # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
-                # the same number of ranks
-                if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
-                    raise ValueError(
-                        f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
-                        f"({self.accelerator.num_processes}) evenly."
-                    )
-
-                if self.vllm_tensor_parallel_size > 1:
-                    # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
-                    # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
-                    self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
-                        [
-                            list(range(i * self.vllm_tensor_parallel_size, (i + 1) * self.vllm_tensor_parallel_size))
-                            for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
-                        ]
-                    )
-
-                # vLLM requires the environment variables to be set for distributed training.
-                os.environ["RANK"] = str(self.accelerator.process_index)
-                os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
-                os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
-                # Ensure distributed rendezvous variables are set without colliding across concurrent runs
-                ensure_master_addr_port()
-
-                if self.max_prompt_length is not None and self.max_completion_length is not None:
-                    max_model_len = self.max_prompt_length + self.max_completion_length
-                else:
-                    max_model_len = None
-                # Use teacher model for vLLM when generate_from_teacher=True
-                vllm_model_path = ref_model.name_or_path if self.generate_from_teacher and ref_model is not None else model.name_or_path
-                logger.info(f"[DEBUG] Initializing vLLM with model: {vllm_model_path}, generate_from_teacher={self.generate_from_teacher}")
-                self.llm = LLM(
-                    model=vllm_model_path,
-                    tensor_parallel_size=args.vllm_tensor_parallel_size,
-                    gpu_memory_utilization=self.vllm_gpu_memory_utilization,
-                    max_num_seqs=self.args.per_device_train_batch_size
-                    * self.vllm_tensor_parallel_size
-                    * self.args.steps_per_generation,
-                    max_model_len=max_model_len,
-                    distributed_executor_backend="external_launcher",
-                    # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                    seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                    # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                    max_num_batched_tokens=4096,
-                    model_impl=self.args.vllm_model_impl,
-                    enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-                    # Important so temperature scaling/logit tweaking affects the TIS log probs
-                    logprobs_mode="processed_logprobs",
-                )
-                if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=1)
-            else:
-                raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
-
-            self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
-
-            # When using vLLM, the main process is responsible for loading the model weights. This can cause process
-            # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
-            # synchronize all processes after vLLM has been fully initialized.
-            self.accelerator.wait_for_everyone()
-        else: # SafeSteer✅ we are using this.
-            generation_kwargs = {
-                "max_new_tokens": self.max_completion_length,
-                "do_sample": True,
-                "pad_token_id": tokenizer.pad_token_id,
-                "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
-                "temperature": self.temperature,
-                "top_p": self.top_p,
-                "top_k": self.top_k,
-                "min_p": self.min_p,
-                "repetition_penalty": self.repetition_penalty,
-                "cache_implementation": args.cache_implementation,
-            }
-            if args.generation_kwargs is not None:
-                generation_kwargs.update(args.generation_kwargs)
-            self.generation_config = GenerationConfig(**generation_kwargs)
-
-        # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
-        # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
-        # self.model_accepts_loss_kwargs to False to enable scaling.
-        self.model_accepts_loss_kwargs = False
-
-        # Add tags to the model
-        self.model.add_model_tags(self._tag_names)
-
-        if self.ref_model is not None: # SafeSteer✅ we do not use any deepspeed or fsdp.
-            if self.is_deepspeed_enabled:
-                print("use deepspeed")
-                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
-            elif self.is_fsdp_enabled:
-                print("use fsdp")
-                self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
-            else: # SafeSteer✅ we are using this one, put the student on cuda:0 and the teacher on cuda:1
-                print("🚀 Placing Teacher model on cuda:1...")
-                self.ref_model = self.ref_model.to("cuda:1")
-                self.ref_model.eval()
+        generation_kwargs = {
+            "max_new_tokens": self.max_completion_length,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+            "cache_implementation": args.cache_implementation,
+        }
+        if args.generation_kwargs is not None:
+            generation_kwargs.update(args.generation_kwargs)
+        self.generation_config = GenerationConfig(**generation_kwargs)
 
         # =====================================================================
-        # SafeSteer: Teacher steering setup
+        # 11. Loss-scaling flag + model tags
+        # =====================================================================
+
+        # We compute loss ourselves, so disable the parent's automatic scaling
+        # behavior that depends on whether the model accepts loss kwargs.
+        self.model_accepts_loss_kwargs = False
+
+        self.model.add_model_tags(self._tag_names)
+
+        if self.ref_model is not None:
+            # SafeSteer✅ is using this one, put the student on cuda:0 and the teacher on cuda:1
+            print("🚀 Placing Teacher model on cuda:1...")
+            self.ref_model = self.ref_model.to("cuda:1")
+            self.ref_model.eval()
+        else:
+            raise ValueError("DistilTrainer requires a reference model for self-distillation. Please provide one via the `ref_model` argument.")
+
+        # =====================================================================
+        # 12. ✅ SafeSteer: Teacher steering setup
         #
         # Decision tree:
         #   L1: use_refusal_vector       -> Teacher steering style (vector vs prompt)
@@ -901,6 +800,8 @@ class DistilTrainer(BaseTrainer):
             
             self.refusal_state = {"safe_tokens": None}
 
+            raise ValueError("DistilTrainer requires a reference model for self-distillation. Please provide one via the `ref_model` argument.")
+
         elif self.use_refusal_vector:
             # ================================================================
             # L1 = True: refusal-vector steering.
@@ -920,7 +821,7 @@ class DistilTrainer(BaseTrainer):
                 candidate_directions = generate_and_save_candidate_directions(
                     model_base, harmful_train_filted, harmless_train_filted,
                 )
-                step_artifact_dir = os.path.join(args.output_dir, "refusal_direction", "step_init")
+                step_artifact_dir = os.path.join(args.output_dir, "refusal_direction", "step_0")
                 if self.accelerator.is_main_process:
                     os.makedirs(os.path.join(step_artifact_dir, "generate_directions"), exist_ok=True)
                     torch.save(
@@ -1346,20 +1247,43 @@ class DistilTrainer(BaseTrainer):
         token_type_ids=None,
         compute_all_logps=True,
     ) -> dict[str, Optional[torch.Tensor]]:
-        """Compute log-probs and (optionally) entropies for each token."""
-        # SafeSteer✅ 1. Get the device of the current model (Student is on cuda:0, Teacher is on cuda:1)
+        """Compute per-token log-probs (and optionally entropies) over the last
+        `logits_to_keep` positions of each sequence.
+
+        Works for both the Student (cuda:0) and the Teacher (cuda:1): inputs
+        are moved to the model's own device for the forward pass, then logits
+        are moved back to the caller's device. The input batch is chunked to
+        keep peak memory bounded.
+
+        Returns
+        -------
+        selected_logps : (B, K)    log-prob of the actual completion tokens
+        logps          : (B, K, V) full per-token log-prob distribution,
+                         or None if compute_all_logps=False
+        entropies      : (B, K)    per-token entropy,
+                         or None if compute_entropy=False
+        """
+        # ----- 1. Device bookkeeping ---------------------------------------
+        # Student is on cuda:0 and Teacher on cuda:1. Forward on the model's
+        # own device, then bring logits back to where the caller's input lived.
         target_device = next(model.parameters()).device
-        original_device = input_ids.device  # SafeSteer✅ Record the original device (cuda:0) to transfer the weights back post-computation
-        
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+        original_device = input_ids.device
+
+        # Chunk the batch to bound peak activation memory.
+        batch_size = batch_size or input_ids.size(0)
         all_selected_logps = []
         all_logps = []
         all_entropies = []
+
+        # ----- 2. Batched forward loop -------------------------------------
         for start in range(0, input_ids.size(0), batch_size):
+            # 2.1 Slice the current chunk.
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
 
-            # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
+            # 2.2 Build model_inputs.
+            # The multimodal branches below are no-ops for our text-only safety
+            # datasets (all image / multimodal kwargs are None on entry).
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
             if image_grid_thw is not None and pixel_values is not None:
                 rows_per_image = image_grid_thw.prod(dim=-1)
@@ -1380,30 +1304,39 @@ class DistilTrainer(BaseTrainer):
             if token_type_ids is not None:
                 model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
 
-            # Only add logits_to_keep if the model supports it
+            # 2.3 Optional model kwargs.
+            # `logits_to_keep`: ask the model to only compute the last K+1
+            # logits if it supports it (older / VLM models may not). The +1 is
+            # the next-token-pred position that gets dropped in 2.5 below.
             if "logits_to_keep" in self.model_kwarg_keys:
-                # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
                 model_inputs["logits_to_keep"] = logits_to_keep + 1
 
-            model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
-            
-            # SafeSteer✅ 2. Move all input tensors to the target device
+            # use_cache is only meaningful during generation; turn it off here
+            # to silence the framework warning during training forward passes.
+            model_inputs["use_cache"] = False
+
+            # 2.4 Move all input tensors to the model's device, run forward,
+            # and bring the logits back to the caller's device.
             for k, v in model_inputs.items():
                 if isinstance(v, torch.Tensor):
                     model_inputs[k] = v.to(target_device)
 
             logits = model(**model_inputs).logits
             logits = logits.to(original_device)
-            # Exclude the last value: it corresponds to the next token pred
-            logits = logits[:, :-1, :]  # (B, L-1, H)
-            # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
-            logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+
+            # 2.5 Trim + scale logits:
+            #   - drop the last position (it's the next-token pred beyond the seq)
+            #   - keep only the last `logits_to_keep` positions (the completion)
+            #   - divide by sampling temperature (see HF RLHF blog, section
+            #     "policy training implementation details")
+            logits = logits[:, :-1, :]                       # (B, L-1, H)
+            logits = logits[:, -logits_to_keep:, :]          # (B, logits_to_keep, H)
             logits = logits / self.temperature
 
+            # 2.6 Per-token logprobs of the actual completion tokens, plus the
+            # full log-prob distribution and entropy if requested.
             completion_ids = input_ids_batch[:, -logits_to_keep:]
-            selected_logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
+            selected_logps = selective_log_softmax(logits, completion_ids)
             if compute_all_logps:
                 logps = log_softmax(logits, dim=-1)
             else:
@@ -1416,6 +1349,7 @@ class DistilTrainer(BaseTrainer):
                     entropies = entropy_from_logits(logits)
                 all_entropies.append(entropies)
 
+        # ----- 3. Concatenate across chunks --------------------------------
         selected_logps = torch.cat(all_selected_logps, dim=0)
         if compute_all_logps:
             logps = torch.cat(all_logps, dim=0)
@@ -1423,135 +1357,6 @@ class DistilTrainer(BaseTrainer):
             logps = None
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         return selected_logps, logps, entropies
-
-    def _fix_param_name_to_vllm(self, name, extra_prefixes: Optional[list[str]] = None):
-        extra_prefixes = extra_prefixes or []
-        prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
-        for prefix in prefixes:
-            name = name.replace(prefix, "")
-        return name
-
-    def _sync_fsdp1_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
-        """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
-        # For FSDP1, we need to recurse into children and also use summon_full_params
-        if visited is None:
-            visited = set()
-        for child_name, child_module in module.named_children():
-            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-            self._sync_fsdp1_params_to_vllm(
-                child_module, prefix=child_prefix, visited=visited
-            )  # recurse into the child
-
-        if isinstance(module, FSDP):
-            with FSDP.summon_full_params(module, recurse=False, writeback=False):
-                for param_name, param in module.named_parameters():
-                    full_name = f"{prefix}.{param_name}" if prefix else param_name
-                    full_name = self._fix_param_name_to_vllm(full_name, extra_prefixes=["_fsdp_wrapped_module."])
-
-                    if full_name in visited:
-                        continue  # skip FSDP subtrees already traversed
-                    visited.add(full_name)
-
-                    if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(full_name, param.data)
-                    elif self.vllm_mode == "colocate":
-                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                        llm_model.load_weights([(full_name, param.data)])
-
-    def _sync_fsdp2_params_to_vllm(self, module: nn.Module):
-        # For FSDP2, module.state_dict() already covers all parameters, so no need for recursion
-        for name, param in module.state_dict().items():
-            if param.is_cpu:
-                param = param.to(torch.device("cuda"))
-            param = param.full_tensor()
-
-            if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                self.vllm_client.update_named_param(name, param)
-            elif self.vllm_mode == "colocate":
-                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                llm_model.load_weights([(name, param)])
-
-    @profiling_decorator
-    def _move_model_to_vllm(self):
-        # Select which model to sync to vLLM: teacher (ref_model) or student (model)
-        # When generate_from_teacher=True, sync the teacher model since vLLM was initialized with teacher weights
-        model_to_sync = self.ref_model if self.generate_from_teacher else self.model
-        
-        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-        if zero_stage_3:
-            import deepspeed
-
-            gather_if_zero3 = deepspeed.zero.GatheredParameters
-        else:
-            gather_if_zero3 = nullcontext
-
-        if is_peft_model(self.model):
-            if self.generate_from_teacher:
-                raise ValueError("PEFT model handling only applies when syncing student model (teacher is typically not PEFT)")
-            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
-            # merging adapters in a sharded manner is not supported.
-            # TODO: does this work with FSDP?
-            with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
-
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                    if fsdp_version == 1:
-                        self._sync_fsdp1_params_to_vllm(
-                            self.model
-                        )  # use memory-efficient post-order traversal for FSDP
-                    elif fsdp_version == 2:
-                        self._sync_fsdp2_params_to_vllm(self.model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name and discard some parameters
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-                # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
-                # Parameters will automatically be repartitioned when exiting the context
-        else:
-            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
-            if self.is_fsdp_enabled:
-                fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                if fsdp_version == 1:
-                    self._sync_fsdp1_params_to_vllm(model_to_sync)  # use memory-efficient post-order traversal for FSDP
-                elif fsdp_version == 2:
-                    self._sync_fsdp2_params_to_vllm(model_to_sync)
-            else:
-                for name, param in model_to_sync.named_parameters():
-                    name = self._fix_param_name_to_vllm(name)
-                    with gather_if_zero3([param]):
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-
-        # Reset cache on vLLM
-        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
-        elif self.vllm_mode == "colocate":
-            self.llm.reset_prefix_cache()
 
     @profiling_decorator
     def _prepare_inputs(
@@ -1645,22 +1450,42 @@ class DistilTrainer(BaseTrainer):
         return rewards_per_func
 
     def _generate_single_turn(self, prompts: list[str], images: Optional[list]):
+        """Run a single-turn generation pass with the Student model.
+
+        Branches on `use_transformers_paged`:
+          - True  : paged-attention `generate_batch` (faster batched gen)
+          - False : standard `model.generate()`
+
+        Returns
+        -------
+        prompt_ids     : list[list[int]] — per-sample prompt token ids
+        completion_ids : list[list[int]] — per-sample completion token ids
+        logprobs       : None (scored later via _get_per_token_logps_and_entropies)
+        forward_kwargs : dict — image-related kwargs to pass through to
+                         downstream forwards (empty when images is None)
+        """
         device = self.accelerator.device
 
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
-        # [{"role": "user", "content": "What color is the sky?"}] to
-        # [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What color is the sky?"}]}]
+        # ----- 1. Prompt prep ----------------------------------------------
+        # 1.1 Multimodal expansion (no-op for our text-only safety datasets).
+        # For multimodal data, expand each conversational user turn from a
+        # plain text "content" into a list of {"type": "image"} +
+        # {"type": "text"} parts so the chat template renders image tokens
+        # correctly.
         kwargs = {}
         if images is not None:
             kwargs = {"images": images}
             for prompt, image_list in zip(prompts, images):
-                if isinstance(prompt, list):  # i.e., when using conversational data
+                if isinstance(prompt, list):
                     prepare_multimodal_messages(prompt, num_images=len(image_list))
 
+        # 1.2 Render prompts via the tokenizer's chat template.
         prompts_text = [
             maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"] for prompt in prompts
         ]
 
+        # 1.3 Extract image tensors (pixel_values etc.) for downstream forward
+        # calls. forward_kwargs stays empty in the text-only case.
         if images is not None:
             prompt_inputs = self.processing_class(text=prompts_text, padding=True, return_tensors="pt", **kwargs)
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
@@ -1668,175 +1493,26 @@ class DistilTrainer(BaseTrainer):
         else:
             forward_kwargs = {}
 
-        # Generate completions using either vLLM or regular generation
-        # Note: When generate_from_teacher=True, vLLM is initialized with teacher weights
-        # SafeSteer✅ we are not using vllm, because vllm does not support activation steering
-        if self.use_vllm:
-            if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
-                # wake up colocated vLLM instances if needed
-                torch.cuda.empty_cache()  # required to avoid OOM in some cases
-                self.llm.wake_up()
-
-            # First, update the vLLM weights if needed
-            # When generate_from_teacher=True and sync_ref_model=False, teacher is static so no sync needed
-            # (vLLM already loaded teacher weights at initialization)
-            should_sync = self.state.global_step != self._last_loaded_step
-            if self.generate_from_teacher and not self.args.sync_ref_model:
-                should_sync = False  # Teacher is static, no need to sync
-            if should_sync:
-                self._move_model_to_vllm()
-                self._last_loaded_step = self.state.global_step
-
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            if self.vllm_mode == "server":
-                all_prompts_text = gather_object(prompts_text)
-                if images is not None:
-                    all_images = gather_object(images)
-
-                if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
-                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-
-                    if images is not None:
-                        ordered_set_of_images = all_images[:: self.num_generations]
-                    else:
-                        ordered_set_of_images = None
-
-                    with profiling_context(self, "vLLM.generate"):
-                        output = self.vllm_client.generate(
-                            prompts=ordered_set_of_prompts,
-                            images=ordered_set_of_images,
-                            n=self.num_generations,
-                            repetition_penalty=self.repetition_penalty,
-                            temperature=self.temperature,
-                            top_p=self.top_p,
-                            top_k=-1 if self.top_k is None else self.top_k,
-                            min_p=0.0 if self.min_p is None else self.min_p,
-                            max_tokens=self.max_completion_length,
-                            truncate_prompt_tokens=self.max_prompt_length,
-                            generation_kwargs=self.args.generation_kwargs,
-                        )
-                        payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"])
-                else:
-                    payload = None
-
-                # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
-                obj_list = [payload]
-                broadcast_object_list(obj_list, from_process=0)
-                all_prompt_ids, all_completion_ids, all_logprobs = obj_list[0]
-
-                # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
-                all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(self.num_generations)]
-
-                process_slice = slice(
-                    self.accelerator.process_index * len(prompts),
-                    (self.accelerator.process_index + 1) * len(prompts),
-                )
-                prompt_ids = all_prompt_ids[process_slice]
-                completion_ids = all_completion_ids[process_slice]
-                logprobs = all_logprobs[process_slice]
-
-            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
-            elif self.vllm_mode == "colocate":
-                generation_kwargs = {
-                    "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
-                    "repetition_penalty": self.repetition_penalty,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                    "top_k": -1 if self.top_k is None else self.top_k,
-                    "min_p": 0.0 if self.min_p is None else self.min_p,
-                    "max_tokens": self.max_completion_length,
-                    "truncate_prompt_tokens": self.max_prompt_length,
-                    "logprobs": 0,  # only return the logprob of the generated token
-                }
-                if self.args.generation_kwargs is not None:
-                    generation_kwargs.update(self.args.generation_kwargs)
-                sampling_params = SamplingParams(**generation_kwargs)
-
-                if self.vllm_tensor_parallel_size > 1:
-                    # Gather prompts from all ranks in the TP group and flatten.
-                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                    orig_size = len(prompts_text)
-                    gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
-                    torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
-                    all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
-
-                    if images is not None:
-                        gathered_images = [None for _ in range(self.vllm_tensor_parallel_size)]
-                        torch.distributed.all_gather_object(gathered_images, images, group=self.tp_group)
-                        all_images = [img for sublist in gathered_images for img in sublist]
-                    else:
-                        all_images = None
-                else:
-                    all_prompts_text = prompts_text
-                    all_images = images
-
-                if images is not None and all_images:
-                    vllm_inputs = []
-                    for prompt, image_list in zip(all_prompts_text, all_images):
-                        vllm_inputs.append({"prompt": prompt, "multi_modal_data": {"image": image_list}})
-
-                else:
-                    vllm_inputs = all_prompts_text
-
-                with profiling_context(self, "vLLM.generate"):
-                    all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
-
-                all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
-                all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
-                all_logprobs = [
-                    [next(iter(lp.values())).logprob for lp in output.logprobs]
-                    for outputs in all_outputs
-                    for output in outputs.outputs
-                ]
-
-                if self.vllm_tensor_parallel_size > 1:
-                    # Slice completions for this rank within its TP group.
-                    # Each rank generates all outputs — we keep only our share.
-                    local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
-                    tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
-                    prompt_ids = all_prompt_ids[tp_slice]
-                    completion_ids = all_completion_ids[tp_slice]
-                    logprobs = all_logprobs[tp_slice]
-                else:
-                    prompt_ids = all_prompt_ids
-                    completion_ids = all_completion_ids
-                    logprobs = all_logprobs
-
-                if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=1)
-        # SafeSteer✅ we are using this 
-        elif self.use_transformers_paged:
+        # ----- 2. Generation -----------------------------------------------
+        if self.use_transformers_paged:
+            # 2.1 Paged generation path (use_transformers_paged=True).
+            # Faster batched generation using transformers' paged-attention
+            # kernels; the attention impl is temporarily switched on the
+            # Student and restored after the call.
             torch.cuda.empty_cache()
-            # Re-process inputs for paged generation if needed
-            # Note: images are already validated and preprocessed above
             paged_prompt_inputs = self.processing_class(text=prompts_text, **kwargs)
             previous_attn = self.model_wrapped.config._attn_implementation
 
-            _pii = paged_prompt_inputs.input_ids
-            if hasattr(_pii, "shape"):
-                _ids_info = f"tensor shape={tuple(_pii.shape)}"
-            else:
-                _lens = [len(x) for x in _pii]
-                _ids_info = f"list batch={len(_pii)} seq_lens min={min(_lens) if _lens else 0} max={max(_lens) if _lens else 0}"
-            print(f"[DEBUG paged] step={self.state.global_step} "
-                  f"num_prompts={len(prompts_text)} input_ids={_ids_info}")
-
+            # Switch attention impl: paged_attention if FA2 is built, else sdpa_paged.
             if is_flash_attn_2_available():
                 self.model_wrapped.config._attn_implementation = "paged_attention"
             else:
                 self.model_wrapped.config._attn_implementation = "sdpa_paged"
             with (
                 profiling_context(self, "transformers.generate_batch"),
-                unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model,
+                unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model,
                 torch.no_grad(),
-                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
-                # Cast to the appropriate dtype based on training configuration
                 if self.args.bf16:
                     unwrapped_model.to(torch.bfloat16)
                 elif self.args.fp16:
@@ -1845,25 +1521,16 @@ class DistilTrainer(BaseTrainer):
                     all_outputs = unwrapped_model.generate_batch(
                         paged_prompt_inputs.input_ids, generation_config=self.generation_config, progress_bar=False
                     )
-                    unwrapped_model.train()  # restore training mode, as generate_batch forces eval mode
-            print(f"[DEBUG paged] step={self.state.global_step} "
-                  f"all_outputs type={type(all_outputs).__name__} len={len(all_outputs) if hasattr(all_outputs, '__len__') else 'NA'} "
-                  f"keys_sample={list(all_outputs.keys())[:3] if hasattr(all_outputs, 'keys') else 'NA'}")
+                    unwrapped_model.train()  # generate_batch forces eval; restore train mode
+
             completion_ids = [output.generated_tokens for output in all_outputs.values()]
-            if len(completion_ids) == 0:
-                print(f"[DEBUG paged] step={self.state.global_step} EMPTY completion_ids! "
-                      f"prompts_text sample (first 2): {prompts_text[:2]}")
-            else:
-                _lens = [len(c) for c in completion_ids]
-                print(f"[DEBUG paged] step={self.state.global_step} "
-                      f"got {len(completion_ids)} completions, lens min={min(_lens)} max={max(_lens)}")
             prompt_ids = paged_prompt_inputs.input_ids
-            # Restore the original attention implementation, training mode
+            # Restore the original attention impl for downstream forward/backward.
             self.model_wrapped.config._attn_implementation = previous_attn
-            logprobs = None  # not used in this case
+            logprobs = None  # paged generate_batch does not return logprobs
 
         else:
-            # Regular generation path
+            # 2.2 Regular generation path (use_transformers_paged=False).
             generate_inputs = self.processing_class(
                 text=prompts_text,
                 return_tensors="pt",
@@ -1878,43 +1545,56 @@ class DistilTrainer(BaseTrainer):
 
             with (
                 profiling_context(self, "transformers.generate"),
-                unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model,
+                unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model,
                 torch.no_grad(),
-                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
                 prompt_completion_ids = unwrapped_model.generate(
                     **generate_inputs, generation_config=self.generation_config, disable_compile=True
                 )
-            # Compute prompt length and extract completion ids
+
+            # 2.3 Split out the completion (everything after the prompt).
             prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
             prompt_length = prompt_ids.size(1)
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-            # Mask everything after the first EOS token
+            # 2.4 Mask everything after the first EOS so pad/garbage tokens are dropped.
             is_eos = completion_ids == self.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+            # 2.5 Convert to per-sample lists, dropping pad positions.
             prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
             completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
-            logprobs = None  # not used in this case
+            logprobs = None  # we score completions later via _get_per_token_logps_and_entropies
 
         return prompt_ids, completion_ids, logprobs, forward_kwargs
 
     def _generate(self, prompts: list[str], images: Optional[list]):
+        """Generate completions for `prompts` and log generation metrics.
+
+        Thin wrapper around `_generate_single_turn` that adds:
+          - aggregating prompt / completion lengths across processes
+          - logging length stats, num_tokens, and EOS-vs-truncation ratio
+
+        Returns
+        -------
+        prompt_ids              : list[list[int]] — per-sample prompt token ids
+        completion_ids          : list[list[int]] — per-sample completion token ids
+        total_completion_tokens : int — sum of completion tokens across the
+                                  global batch (= num_items_in_batch, used
+                                  by the DAPO loss scaler)
+        logprobs                : None (forwarded from _generate_single_turn)
+        forward_kwargs          : dict (forwarded from _generate_single_turn)
+        """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
+        # ----- 1. Run generation -------------------------------------------
         prompt_ids, completion_ids, logprobs, forward_kwargs = self._generate_single_turn(prompts, images)
 
-        print(f"[DEBUG _generate] step={self.state.global_step} mode={mode} "
-              f"len(prompts)={len(prompts)} len(prompt_ids)={len(prompt_ids)} "
-              f"len(completion_ids)={len(completion_ids)}")
-
-        # Get completion length per sequence, used for logging
+        # ----- 2. Aggregate lengths across processes -----------------------
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
         completion_lengths = torch.tensor([len(ids) for ids in completion_ids], device=device)
         agg_prompt_lengths = self.accelerator.gather(prompt_lengths)
@@ -1922,27 +1602,26 @@ class DistilTrainer(BaseTrainer):
         total_prompt_tokens = agg_prompt_lengths.sum()
         total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
 
-        print(f"[DEBUG _generate] step={self.state.global_step} "
-              f"completion_lengths.shape={tuple(completion_lengths.shape)} numel={completion_lengths.numel()} "
-              f"agg_completion_lengths.shape={tuple(agg_completion_lengths.shape)} numel={agg_completion_lengths.numel()}")
-
-        # Log the metrics
+        # ----- 3. Logging --------------------------------------------------
+        # 3.1 Cumulative input-token count (training only).
         if mode == "train":
             self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
         self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-        # Log completion lengths, mean, min, max
+        # 3.2 Completion-length distribution.
         self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with EOS and log their lengths
+        # 3.3 Truncated vs EOS-terminated. A completion is "truncated" if its
+        # last token is neither EOS nor PAD (i.e., generation hit
+        # max_new_tokens before producing EOS).
         eos_and_pad = [self.eos_token_id, self.pad_token_id]
         is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
         term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+        if len(term_completion_lengths) == 0:  # edge case: no terminated sequences in batch
             term_completion_lengths = torch.zeros(1, device=device)
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
@@ -1950,15 +1629,120 @@ class DistilTrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, total_completion_tokens, logprobs, forward_kwargs
 
+    def _generate_with_teacher(self, prompts: list[str], images: Optional[list]):
+        """Generate completions from the Teacher (self.ref_model) for debug logging.
+
+        Used by `log_teacher_completions`; never participates in the training
+        loss. The ActAdd hook on the Teacher fires automatically during this
+        forward pass (since refusal_state["is_active"] is True), so the output
+        reflects the *steered* Teacher distribution.
+
+        The Teacher is a raw PreTrainedModel on cuda:1 in .eval() mode, with
+        no accelerator wrapping — so we skip `unwrap_model_for_generation`,
+        skip the `.train()` restore, skip the dtype cast, and manually move
+        inputs to the Teacher's device.
+
+        Returns
+        -------
+        prompt_ids     : list[list[int]] — per-sample prompt token ids
+        completion_ids : list[list[int]] — per-sample completion token ids
+        """
+        teacher_device = next(self.ref_model.parameters()).device
+
+        # ----- 1. Prompt prep ----------------------------------------------
+        # 1.1 Multimodal expansion (no-op for our text-only safety datasets).
+        # For multimodal data, expand each conversational user turn from a
+        # plain text "content" into a list of {"type": "image"} +
+        # {"type": "text"} parts so the chat template renders image tokens
+        # correctly.
+        kwargs = {}
+        if images is not None:
+            kwargs = {"images": images}
+            for prompt, image_list in zip(prompts, images):
+                if isinstance(prompt, list):
+                    prepare_multimodal_messages(prompt, num_images=len(image_list))
+
+        # 1.2 Render prompts via the tokenizer's chat template.
+        prompts_text = [
+            maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"] for prompt in prompts
+        ]
+
+        # 1.3 Tokenize and move all input tensors to the Teacher's device
+        # (cuda:1). We bypass super()._prepare_inputs which would put them
+        # on the trainer's default device (cuda:0).
+        generate_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            max_length=self.max_prompt_length,
+            truncation=True,
+            add_special_tokens=False,
+            **kwargs,
+        )
+        generate_inputs = {                                                                                                                                                                                                                                                                                                                                                                                      
+            k: (v.to(teacher_device) if isinstance(v, torch.Tensor) else v)
+            for k, v in generate_inputs.items()                                                                                                                                                                                                                                                                                                                                                                  
+        }
+
+        # ----- 2. Generation -----------------------------------------------
+        with torch.no_grad():
+            prompt_completion_ids = self.ref_model.generate(
+                **generate_inputs,
+                generation_config=self.generation_config,
+                disable_compile=True,
+            )
+
+        # ----- 3. Post-process ---------------------------------------------
+        # 3.1 Split out the completion (everything after the prompt).
+        prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
+        prompt_length = prompt_ids.size(1)
+        completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # 3.2 Mask everything after the first EOS so pad/garbage tokens are dropped.
+        is_eos = completion_ids == self.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1),
+                             dtype=torch.long, device=teacher_device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=teacher_device) \
+                                .expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # 3.3 Convert to per-sample Python lists, dropping pad positions
+        # (matches _generate_single_turn's regular path).
+        prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
+        completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
+        return prompt_ids, completion_ids
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        """End-to-end preprocessing of one generation batch into the dict
+        consumed by `_compute_loss`.
+
+        Pipeline:
+          1. Parse `inputs` into prompts / teacher_prompts / images.
+          2. Run generations: Student (always) + optional Teacher (debug).
+          3. Re-tokenize both prompt variants for downstream use.
+          4. Pad everything into padded tensors and optionally mask
+             truncated completions.
+          5. Build concatenated (prompt + completion) sequences for the
+             scoring forward pass.
+          6. Compute reference-model per-token logps
+             (old_per_token_logps for importance sampling,
+              ref_per_token_logps for KL).
+          7. Decode for wandb display + populate the bounded log buffers.
+          8. Assemble and return the output dict.
+        """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
+        # ----- 1. Parse inputs ---------------------------------------------
+        # 1.1 Prompts (un-steered) and teacher_prompts (steering wrapper).
         prompts = [x["prompt"] for x in inputs]
         teacher_prompts = [x["teacher_prompt"] for x in inputs]
 
+        # 1.2 Images (no-op for our text-only datasets, kept for VLM compat).
         if "images" in inputs[0]:
             images = [example.get("images") for example in inputs]
         elif "image" in inputs[0]:
@@ -1969,45 +1753,32 @@ class DistilTrainer(BaseTrainer):
         if images is not None and all(img_list == [] for img_list in images):
             images = None
 
-        # Decide whether to generate from teacher (with context) or student (without context)
-        # SafeSteer✅ our generate_from_teacher is false
-        generation_prompts = teacher_prompts if self.generate_from_teacher else prompts
-
+        # ----- 2. Run generations ------------------------------------------
+        # 2.1 Student always generates the training-side completions, using
+        # the plain (un-steered) prompts.
         (
-            _generation_prompt_ids_list,  # Discard - we'll compute student/teacher prompt IDs separately
+            _generation_prompt_ids_list,  # discard — student/teacher prompt IDs are recomputed below
             completion_ids_list,
             num_items_in_batch,
             sampling_per_token_logps_list,
             forward_kwargs,
-        ) = self._generate(generation_prompts, images)
-        
-        # SafeSteer✅ Debug only: let teacher generate a separate completion so we can inspect
-        # SafeSteer✅ the effect of refusal-vector / system-prompt injection on the teacher. Off by default.
+        ) = self._generate(prompts, images)
+
+        # 2.2 Debug only: have the steered Teacher generate a separate
+        # completion from teacher_prompts so we can inspect the effect of
+        # refusal-vector / system-prompt injection. Off by default; never
+        # affects training.
         if getattr(self.args, "log_teacher_completions", False):
-            self.generate_from_teacher = not self.generate_from_teacher
-
-            generation_prompts_teacher = teacher_prompts if self.generate_from_teacher else prompts
-
-            (
-                _generation_prompt_ids_list_teacher,  # Discard - we'll compute student/teacher prompt IDs separately
-                completion_ids_list_teacher,
-                num_items_in_batch_teacher,
-                sampling_per_token_logps_list_teacher,
-                forward_kwargs_teacher,
-            ) = self._generate(generation_prompts_teacher, images)
-
-            # Flip back so the global state is unchanged across steps
-            self.generate_from_teacher = not self.generate_from_teacher
+            _, completion_ids_list_teacher = self._generate_with_teacher(teacher_prompts, images)
         else:
             completion_ids_list_teacher = None
 
-        # Process student prompts (always used for student training, regardless of generation source)
+        # ----- 3. Re-tokenize prompt variants ------------------------------
+        # 3.1 Student prompts (plain, un-steered).
         prompts_text = [
             maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"] for prompt in prompts
         ]
 
-        if self.use_vllm:
-            self.processing_class.truncation_side = "left"
         student_inputs = self.processing_class(
             text=prompts_text,
             return_tensors="pt",
@@ -2020,8 +1791,8 @@ class DistilTrainer(BaseTrainer):
         student_inputs = super()._prepare_inputs(student_inputs)
         student_prompt_ids, student_prompt_mask = student_inputs["input_ids"], student_inputs["attention_mask"]
         prompt_ids_list = [p[m].tolist() for p, m in zip(student_prompt_ids, student_prompt_mask.bool())]
-        
-        # Process teacher prompts (always used for teacher, regardless of generation source)
+
+        # 3.2 Teacher prompts (carry the steering wrapper / system prompt).
         teacher_prompts_text = [
             maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"] for prompt in teacher_prompts
         ]
@@ -2036,20 +1807,25 @@ class DistilTrainer(BaseTrainer):
             add_special_tokens=False,
         )
         teacher_inputs = super()._prepare_inputs(teacher_inputs)
-        if self.use_vllm:
-            self.processing_class.truncation_side = "right"
+
         teacher_prompt_ids, teacher_prompt_mask = teacher_inputs["input_ids"], teacher_inputs["attention_mask"]
         teacher_prompt_ids_list = [p[m].tolist() for p, m in zip(teacher_prompt_ids, teacher_prompt_mask.bool())]
 
-        # Convert lists of token IDs to padded tensors
+        # ----- 4. Pad everything into padded tensors -----------------------
+        # 4.1 Student prompt ids/mask (left-padded).
         prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+
+        # 4.2 Teacher prompt ids/mask (left-padded).
         teacher_prompt_ids = [torch.tensor(ids, device=device) for ids in teacher_prompt_ids_list]
         teacher_prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in teacher_prompt_ids]
         teacher_prompt_ids = pad(teacher_prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         teacher_prompt_mask = pad(teacher_prompt_mask, padding_value=0, padding_side="left")
+
+        # 4.3 Completion ids/mask (right-padded) + optional Teacher debug
+        # completion.
         completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
@@ -2059,24 +1835,31 @@ class DistilTrainer(BaseTrainer):
         else:
             completion_ids_teacher = None
         completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+        # 4.4 Optional: per-token logps from the sampling pass (used by some
+        # loss variants for importance-sampling correction).
         if sampling_per_token_logps_list is not None:
             sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in sampling_per_token_logps_list]
             sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
         else:
             sampling_per_token_logps = None
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+        # 4.5 Optional: zero out completion_mask on truncated samples so the
+        # loss never trains on incomplete generations.
         if self.mask_truncated_completions:
             eos_and_pad = [self.eos_token_id, self.pad_token_id]
             is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
+        # ----- 5. Build concatenated sequences for the forward pass --------
+        # Build (prompt + completion) for both Student and Teacher prompt
+        # variants. The completion segment is shared between them.
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
         teacher_prompt_completion_ids = torch.cat([teacher_prompt_ids, completion_ids], dim=1)  # (B, P+C)
         teacher_attention_mask = torch.cat([teacher_prompt_mask, completion_mask], dim=1)  # (B, P+C)
-        # If token_type_ids are used, extend them with zeros for the completion part
+        # Extend token_type_ids with zeros over the completion segment (only
+        # fires for models that use token_type_ids; no-op otherwise).
         if "token_type_ids" in forward_kwargs:
             token_type_ids = forward_kwargs["token_type_ids"]
             forward_kwargs["token_type_ids"] = torch.cat(
@@ -2088,19 +1871,18 @@ class DistilTrainer(BaseTrainer):
 
         num_images = [len(img_list) for img_list in images] if images is not None else None
 
+        # ----- 6. Reference-model per-token logps --------------------------
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
-            # Skip when generate_from_teacher=True since importance sampling is not used in that case.
+            # 6.1 old_per_token_logps for importance sampling.
+            # If the generation and optimization steps are misaligned — i.e.,
+            # if generation does not occur at the end of a full optimizer
+            # step (when gradient_accumulation_steps is not a multiple of
+            # generate_every) — then the samples may come from an earlier
+            # version of the model. In that case we need to track
+            # old_per_token_logps for importance sampling. If the steps are
+            # aligned, importance sampling is unnecessary and we leave it None.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if not self.generate_from_teacher and (
-                self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction)):
+            if self.args.gradient_accumulation_steps % generate_every != 0:
                 old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
@@ -2114,17 +1896,9 @@ class DistilTrainer(BaseTrainer):
             else:
                 old_per_token_logps = None
 
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            # Skip when generate_from_teacher=True since vLLM has teacher weights (no mismatch to correct)
-            if self.use_vllm and self.vllm_importance_sampling_correction and not self.generate_from_teacher:
-                importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
-                importance_sampling_ratio = torch.clamp(
-                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                )
-            else:
-                importance_sampling_ratio = None
-
-            # Compute the per-token log probabilities for the reference model
+            # 6.2 ref_per_token_logps from the Teacher (or, for PEFT setups,
+            # the Student with adapter disabled). Used by the KL penalty
+            # when beta != 0.
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
@@ -2148,14 +1922,15 @@ class DistilTrainer(BaseTrainer):
                             num_images=num_images,
                             compute_all_logps=False,
                             **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                        )   
+                        )
             else:
                 ref_per_token_logps = None
 
-        # Decode
+        # ----- 7. Decode + populate log buffers ----------------------------
+        # 7.1 Decode for wandb display.
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
         teacher_prompts_text = self.processing_class.batch_decode(teacher_prompt_ids, skip_special_tokens=True)
-        
+
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         completions_text_teacher = (
             self.processing_class.batch_decode(completion_ids_teacher, skip_special_tokens=True)
@@ -2168,15 +1943,17 @@ class DistilTrainer(BaseTrainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_text
-        
-        # Not really necessary, but keeping for now
+
+        # 7.2 Placeholder rewards / advantages — kept as zeros; SafeSteer's
+        # loss does not actually consume them, but the buffers still need to
+        # be populated for downstream `log()`.
         rewards = torch.zeros_like(completion_ids, dtype=torch.float32)
         advantages = rewards
-        
+
         # Keep a copy for logging (data is already local to each process, no slicing needed)
         all_process_advantages = advantages.clone()
 
-        # Log prompt and completion texts
+        # 7.3 Extend the bounded log buffers consumed by `log()`.
         self._logs["prompt"].extend(gather_object(prompts_text))
         self._logs["teacher_prompt"].extend(gather_object(teacher_prompts_text))
         self._logs["completion"].extend(gather_object(completions_text))
@@ -2192,38 +1969,9 @@ class DistilTrainer(BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if importance_sampling_ratio is not None:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            delta = delta[completion_mask.bool()]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
 
-            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
-
+        # ----- 8. Build output dict ----------------------------------------
+        # Keys here are exactly what `_compute_loss` reads downstream.
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -2236,8 +1984,6 @@ class DistilTrainer(BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
-        if importance_sampling_ratio is not None:
-            output["importance_sampling_ratio"] = importance_sampling_ratio
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
@@ -2261,14 +2007,32 @@ class DistilTrainer(BaseTrainer):
         return self._compute_loss(model, inputs)
     
     def _compute_loss(self, model, inputs):
-        # Compute the per-token log probabilities for the model
+        """Compute the SafeSteer distillation loss.
+
+        Pipeline:
+          1. Unpack inputs from `_generate_and_score_completions`.
+          2. Build loss_completion_mask (with skip / keep first N tokens).
+          3. Concatenate (prompt + completion) for Student and Teacher.
+          4. Forward passes: Student (with entropy) + Teacher (no grad).
+          5. Optional entropy mask (keep only top-quantile tokens).
+          6. Optional KL-to-init-model penalty (when beta != 0).
+          7. Vocabulary selection on logps
+             (mode 1: top-K Teacher; mode 2: safe_tokens set).
+          8. KL divergence between Student and Teacher
+             (alpha = 0 forward, 1 reverse, in-between Generalized JSD).
+          9. Reduce to scalar loss + grad-accum scaling.
+         10. Log metrics (kl_approx, optional kl_to_base_model, entropy).
+        """
+        # ----- 1. Unpack inputs --------------------------------------------
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         teacher_prompt_ids, teacher_prompt_mask = inputs["teacher_prompt_ids"], inputs["teacher_prompt_mask"]
-        
-        # Create a separate mask for loss computation that skips the first N tokens
-        # Note: completion_mask is used for both attention (forward pass) and loss computation
-        # We need to keep the original for attention, but create a modified one for loss
+
+        # ----- 2. Build loss_completion_mask -------------------------------
+        # completion_mask drives both the attention forward pass and the loss.
+        # We keep the original for attention but build a separate mask for the
+        # loss so we can optionally skip the leading N tokens and/or keep
+        # only the first M tokens.
         loss_completion_mask = completion_mask
         if self.num_loss_tokens_to_skip > 0 or self.num_loss_tokens_to_keep > 0:
             batch_size, seq_len = completion_mask.shape
@@ -2280,13 +2044,15 @@ class DistilTrainer(BaseTrainer):
                 keep_mask = (token_positions < self.num_loss_tokens_to_keep).int()
                 loss_completion_mask = loss_completion_mask * keep_mask
 
+        # ----- 3. Build concatenated sequences -----------------------------
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         teacher_input_ids = torch.cat([teacher_prompt_ids, completion_ids], dim=1)
         teacher_attention_mask = torch.cat([teacher_prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Compute the per_token_logps and the entropy at each position in the completion
+        # ----- 4. Forward passes -------------------------------------------
+        # 4.1 Student: per-token logps, full distribution, and entropy.
         per_token_logps, all_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
@@ -2302,6 +2068,8 @@ class DistilTrainer(BaseTrainer):
         )
         torch.cuda.empty_cache()
 
+        # 4.2 Teacher (no grad). The ActAdd hook auto-steers the distribution
+        # since refusal_state["is_active"] is True.
         with torch.no_grad():
             teacher_per_token_logps, teacher_all_logps, teacher_entropies = self._get_per_token_logps_and_entropies(
                 self.ref_model,
@@ -2317,20 +2085,27 @@ class DistilTrainer(BaseTrainer):
                 token_type_ids=inputs.get("token_type_ids"),
             )
 
+        # ----- 5. Optional entropy mask ------------------------------------
+        # Keep only positions whose Student entropy falls in the top quantile.
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, loss_completion_mask, 1 - self.top_entropy_quantile)
         else:
             entropy_mask = None
 
-        # Compute the KL divergence between the model and the reference model
+        # ----- 6. Optional KL-to-init-model penalty ------------------------
+        # When beta != 0, add a per-token KL between the current Student and
+        # the reference logps captured in `_generate_and_score_completions`.
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"]
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
 
-        # SafeSteer✅ loss computation with vocabulary selection
+        # ----- 7. Vocabulary selection on logps ----------------------------
+        # Narrow the KL comparison to a token subset so the Student is steered
+        # only on "safe" tokens instead of the full vocab.
         if self.args.voca_selection_mode == 1:
+            # Mode 1: top-K of the Teacher's distribution at each position.
             k = self.args.voca_selection_num
             _, topk_indices = teacher_all_logps.topk(k, dim=-1)
             all_logps = all_logps.gather(-1, topk_indices)
@@ -2341,6 +2116,8 @@ class DistilTrainer(BaseTrainer):
                 all_logps = all_logps - all_logps.logsumexp(dim=-1, keepdim=True)
                 teacher_all_logps = teacher_all_logps - teacher_all_logps.logsumexp(dim=-1, keepdim=True)
         elif self.args.voca_selection_mode == 2:
+            # Mode 2: a fixed safe_tokens set (precomputed at init and
+            # optionally refreshed by the safe-token callback).
             safe_tokens = self.refusal_state["safe_tokens"].to(all_logps.device)  # [k]
             k = safe_tokens.size(0)
             safe_indices = safe_tokens.unsqueeze(0).unsqueeze(0).expand(
@@ -2354,9 +2131,15 @@ class DistilTrainer(BaseTrainer):
                 # within the safe set (empirically over-refuses).
                 all_logps = all_logps - all_logps.logsumexp(dim=-1, keepdim=True)
                 teacher_all_logps = teacher_all_logps - teacher_all_logps.logsumexp(dim=-1, keepdim=True)
-        
-        # Compute KL divergences using F.kl_div
-        # PyTorch differs from the standard mathematical definition, so the order of the probability distributions is swapped compared to that defined in the paper.
+
+        # ----- 8. KL divergence loss ---------------------------------------
+        # alpha controls the direction:
+        #   alpha = 0  -> forward KL  (KL(Teacher || Student))
+        #   alpha = 1  -> reverse KL  (KL(Student || Teacher))
+        #   0 < alpha < 1 -> Generalized Jensen-Shannon Divergence
+        # Note: PyTorch's F.kl_div argument order differs from the standard
+        # mathematical definition, so the order of the two distributions is
+        # swapped relative to the paper.
         if self.alpha == 0: #Forward KL
             kl_loss = kl_div(all_logps, teacher_all_logps, reduction="none", log_target=True)
         elif self.alpha == 1: #Reverse KL
@@ -2376,33 +2159,35 @@ class DistilTrainer(BaseTrainer):
             # Compute the Generalized Jensen-Shannon Divergence
             kl_loss = alpha * kl_teacher + (1 - alpha) * kl_student
         per_token_loss = kl_loss.sum(-1)
-        
+
+        # Free the big vocab-sized tensors before the final reduction.
         del all_logps
         del teacher_all_logps
         if 'mixture_log_probs' in locals():
             del mixture_log_probs
         torch.cuda.empty_cache()
 
-        if self.use_vllm and self.vllm_importance_sampling_correction and not self.generate_from_teacher:
-            ratio = inputs["importance_sampling_ratio"]
-            importance_weights = (ratio * loss_completion_mask).sum(-1) / loss_completion_mask.sum(-1).clamp(min=1.0)
-            importance_weights = importance_weights.unsqueeze(-1)
-            per_token_loss = per_token_loss * importance_weights
-
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
+        # ----- 9. Reduce to scalar loss ------------------------------------
+        # Per-sample mean over valid completion positions, then batch mean,
+        # then divide by gradient accumulation steps (we set
+        # compute_loss_func to a non-None value in __init__ to disable the
+        # parent's automatic gradient-accumulation scaling).
         loss = ((per_token_loss * loss_completion_mask).sum(-1) / loss_completion_mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / self.current_gradient_accumulation_steps
 
-        # Log the metrics
+        # ----- 10. Log metrics ---------------------------------------------
         mode = "train" if self.model.training else "eval"
 
+        # 10.1 kl_approx: unbiased estimator of KL(Student || Teacher) per
+        # http://joschu.net/blog/kl-approx.html (k3 form).
         with torch.no_grad():
             kl_approx = (per_token_logps - teacher_per_token_logps) + torch.exp(teacher_per_token_logps - per_token_logps) - 1
             kl_approx_mean = (kl_approx * loss_completion_mask).sum() / loss_completion_mask.sum()
         self._metrics[mode]["kl_approx"].append(self.accelerator.gather(kl_approx_mean).nanmean().item())
-        
+
         loss_completion_token_count = loss_completion_mask.sum().clamp(min=1.0)
 
         def masked_batch_mean(x):
@@ -2411,10 +2196,12 @@ class DistilTrainer(BaseTrainer):
             else:
                 return (x * loss_completion_mask).sum() / loss_completion_token_count
 
+        # 10.2 KL to the init-model reference (only when beta != 0).
         if self.beta != 0.0:
             mean_kl = masked_batch_mean(per_token_kl)
             self._metrics[mode]["kl_to_base_model"].append(self.accelerator.gather(mean_kl).nanmean().item())
 
+        # 10.3 Student entropy averaged over valid positions.
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
@@ -2430,6 +2217,19 @@ class DistilTrainer(BaseTrainer):
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        """Aggregate buffered metrics and emit them to the parent log + wandb.
+
+        Steps:
+          1. Average all scalars in `_metrics[mode]` and (in eval mode)
+             prefix with "eval_" to match HF's convention.
+          2. Forward to `super().log()` and clear the buffer.
+          3. If log_completions is set, pretty-print a sample of
+             prompts / completions to the console (main process only).
+          4. If wandb is configured, upload a per-step table of prompts /
+             completions / rewards / (optional) teacher completions and
+             images.
+        """
+        # ----- 1. Aggregate scalar metrics ---------------------------------
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -2438,11 +2238,14 @@ class DistilTrainer(BaseTrainer):
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
+        # ----- 2. Forward to parent log() + clear buffer -------------------
         logs = {**logs, **metrics}
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
+        # Sections 3 and 4 below are completion-table logging; main process only.
         if self.accelerator.is_main_process and self.log_completions:
+            # ----- 3. Console pretty-print sample --------------------------
             if is_rich_available():
                 print_prompt_completions_sample(
                     self._logs["prompt"],
@@ -2454,9 +2257,12 @@ class DistilTrainer(BaseTrainer):
                     self.num_completions_to_print,
                 )
 
+            # ----- 4. Wandb completions table ------------------------------
             if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                 import pandas as pd
 
+                # 4.1 Build the table columns. teacher_completions and images
+                # are optional and are conditionally appended.
                 table = {
                     "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
                     "prompt": self._logs["prompt"],
@@ -2474,6 +2280,7 @@ class DistilTrainer(BaseTrainer):
                         # Convert images to wandb Image objects for proper visualization
                         table["images"].append([wandb.Image(image) for image in image_list])
 
+                # 4.2 Build DataFrame, optionally dedupe by prompt, push to wandb.
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])

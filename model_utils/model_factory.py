@@ -6,7 +6,7 @@ def construct_model_base(ori_model: AutoModelForCausalLM, ori_tokenier: AutoToke
     if 'qwen2.5' in model_path.lower():
         from model_utils.qwen25_model import Qwen25Model
         return Qwen25Model(ori_model, ori_tokenier)
-    elif  'qwen3' in model_path.lower():
+    elif 'qwen3' in model_path.lower():
         from model_utils.qwen3_model import Qwen3Model
         return Qwen3Model(ori_model, ori_tokenier)
     elif 'llama-3' in model_path.lower():

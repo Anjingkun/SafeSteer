@@ -1,0 +1,29 @@
+# Trained model artifacts (huge, never tracked)
+model_weights/
+*.pt
+*.bin
+*.safetensors
+
+# Training / experiment outputs
+wandb/
+logs/
+outputs/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local environment / secrets
+.env
+.envrc
+
+# Known dead backup file (you said you'd delete it)
+distil_trainer copy.py

@@ -1,24 +1,24 @@
+import os
+import json
 import torch
 import einops
 from torch import Tensor
 from jaxtyping import Int, Float
 from utils.select_direction import get_refusal_scores, select_direction
 from utils.generate_directions import generate_directions
-def get_orthogonalized_matrix(matrix: Float[Tensor, '... d_model'], vec: Float[Tensor, 'd_model']) -> Float[Tensor, '... d_model']:
-    vec = vec / torch.norm(vec)
-    vec = vec.to(matrix)
-
-    proj = einops.einsum(matrix, vec.unsqueeze(-1), '... d_model, d_model single -> ... single') * vec
-    return matrix - proj
-
-import os
-import json
 
 SPLITS = ['train', 'val', 'test']
 HARMTYPES = ['harmless', 'harmful']
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPLIT_DATASET_FILENAME = os.path.join(_PROJECT_ROOT, 'data', 'refusal_direction_splits', '{harmtype}_{split}.json')
+
+def get_orthogonalized_matrix(matrix: Float[Tensor, '... d_model'], vec: Float[Tensor, 'd_model']) -> Float[Tensor, '... d_model']:
+    vec = vec / torch.norm(vec)
+    vec = vec.to(matrix)
+
+    proj = einops.einsum(matrix, vec.unsqueeze(-1), '... d_model, d_model single -> ... single') * vec
+    return matrix - proj
 
 def load_dataset_split(harmtype: str, split: str, instructions_only: bool=False):
     assert harmtype in HARMTYPES
