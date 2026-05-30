@@ -25,5 +25,5 @@ __pycache__/
 .env
 .envrc
 
-# Known dead backup file (you said you'd delete it)
-distil_trainer copy.py
+# Local-only backup file (kept on disk, never tracked)
+distil_trainer_copy.py
