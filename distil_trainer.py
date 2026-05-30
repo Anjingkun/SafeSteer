@@ -896,7 +896,7 @@ class DistilTrainer(BaseTrainer):
                 )
                 if self.accelerator.is_main_process:
                     print(f"SafeSteer✅ Initial safe_tokens computed via refusal-vector "
-                          f"(K={self.args.voca_selection_num}, horizon={self.args.safe_token_horizon})")
+                          f"(safe token num={self.args.voca_selection_num}, horizon={self.args.safe_token_horizon})")
 
                 # L3: callbacks (only when Teacher is not frozen)
                 if args.sync_ref_model:
@@ -904,7 +904,7 @@ class DistilTrainer(BaseTrainer):
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
                     if self.accelerator.is_main_process:
-                            print("SafeSteer✅  Registered reference model synchronization callback.")
+                            print("SafeSteer✅ Registered reference model synchronization callback.")
                     if self.args.update_refusal_vector:
                         self.add_callback(DynamicRefusalVectorCallback(
                             trainer=self,
@@ -912,7 +912,7 @@ class DistilTrainer(BaseTrainer):
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
                         if self.accelerator.is_main_process:
-                            print("SafeSteer✅  Registered dynamic update-refusal-vector callback.")
+                            print("SafeSteer✅ Registered dynamic update-refusal-vector callback.")
                     elif self.accelerator.is_main_process:
                         print("⏸️  update_refusal_vector=False → direction frozen at init.")
                     if not self.args.freeze_safe_token:
@@ -936,6 +936,8 @@ class DistilTrainer(BaseTrainer):
                     self.add_callback(MemoryEfficientSyncRefModelCallback(
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
+                    if self.accelerator.is_main_process:
+                        print("SafeSteer✅ Registered reference model synchronization callback.")
                     if self.args.update_refusal_vector:
                         self.add_callback(DynamicRefusalVectorCallback(
                             trainer=self,
@@ -943,7 +945,7 @@ class DistilTrainer(BaseTrainer):
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
                         if self.accelerator.is_main_process:
-                            print("SafeSteer✅  Registered dynamic update-refusal-vector callback.")
+                            print("SafeSteer✅ Registered dynamic update-refusal-vector callback.")
                     elif self.accelerator.is_main_process:
                         print("⏸️  update_refusal_vector=False → direction frozen at init.")
                 elif self.accelerator.is_main_process:
@@ -964,6 +966,8 @@ class DistilTrainer(BaseTrainer):
                     )
 
                 with torch.no_grad():
+                    if self.accelerator.is_main_process:
+                        print("🔄 Generating initial safe_tokens via system-prompt-steered Teacher...")
                     harmful_train, harmless_train, harmful_val, harmless_val = \
                         self.load_and_sample_datasets_for_refusal_direction(args.seed)
                     unwrapped_ref_model = self.accelerator.unwrap_model(self.ref_model)
@@ -990,7 +994,6 @@ class DistilTrainer(BaseTrainer):
                         exclude_special_tokens=self.args.exclude_special_tokens,
                         min_steered_prob=self.args.min_steered_prob,
                     )
-                    torch.cuda.empty_cache()
 
                 self.refusal_state = {"safe_tokens": safe_token_ids.cpu()}
                 _dump_safe_tokens_trace(
@@ -1003,14 +1006,14 @@ class DistilTrainer(BaseTrainer):
                 )
                 if self.accelerator.is_main_process:
                     print(f"SafeSteer✅ Initial safe_tokens computed via system-prompt "
-                          f"(K={self.args.voca_selection_num}, horizon={self.args.safe_token_horizon})")
+                          f"(safe token num={self.args.voca_selection_num}, horizon={self.args.safe_token_horizon})")
 
                 if args.sync_ref_model:
                     self.add_callback(MemoryEfficientSyncRefModelCallback(
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
                     if self.accelerator.is_main_process:
-                            print("SafeSteer✅  Registered reference model synchronization callback.")
+                            print("SafeSteer✅ Registered reference model synchronization callback.")
                     if not self.args.freeze_safe_token:
                         self.add_callback(DynamicSafeTokenViaSystemPromptCallback(
                             trainer=self,
@@ -1035,7 +1038,7 @@ class DistilTrainer(BaseTrainer):
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
                     if self.accelerator.is_main_process:
-                        print("SafeSteer✅  Registered reference model synchronization callback.")
+                        print("SafeSteer✅ Registered reference model synchronization callback.")
                 elif self.accelerator.is_main_process:
                     print("⏸️  sync_ref_model=False → no dynamic refresh callbacks registered.")
 
@@ -2294,8 +2297,15 @@ class DistilTrainer(BaseTrainer):
                     **self._logs["rewards"],
                     "advantage": self._logs["advantages"],
                 }
-                if self.args.log_teacher_completions and len(self._logs["completion_teacher"]) == len(self._logs["prompt"]):
-                    table["completion_teacher"] = self._logs["completion_teacher"]
+                if self.args.log_teacher_completions:
+                    # Pad with empty strings if teacher buffer hasn't caught up yet.                                                                                                                                                                                                                                                                                                                                   
+                    n = len(self._logs["prompt"])                                                                                                                                                                                                                                                                                                                                                                      
+                    teacher_col = list(self._logs["completion_teacher"])                                                                                                                                                                                                                                                                                                                                               
+                    if len(teacher_col) < n:                                                                                                                                                                                                                                                                                                                                                                           
+                        teacher_col = [""] * (n - len(teacher_col)) + teacher_col
+                    elif len(teacher_col) > n:                                                                                                                                                                                                                                                                                                                                                                         
+                        teacher_col = teacher_col[-n:]  
+                    table["completion_teacher"] = teacher_col 
 
                 if self._logs["images"]:
                     table["images"] = []
@@ -2307,7 +2317,20 @@ class DistilTrainer(BaseTrainer):
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+
+                # 4.3 Maintain a single growing DataFrame across log() calls.
+                # Each log call uploads the FULL accumulated history as a
+                # fresh wandb.Table under the same key, so the wandb UI shows
+                # exactly one panel/table that grows over time. This sidesteps
+                # all schema-mismatch / version-history rendering quirks.
+                # Lazy-init `_completions_df` to avoid touching __init__.
+                if getattr(self, "_completions_df", None) is None:
+                    self._completions_df = df
+                else:
+                    self._completions_df = pd.concat(
+                        [self._completions_df, df], ignore_index=True
+                    )
+                wandb.log({"completions": wandb.Table(dataframe=self._completions_df)})
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

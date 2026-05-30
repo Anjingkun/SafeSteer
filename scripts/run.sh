@@ -30,9 +30,9 @@ PAIRS=(
 
 COMMON_ARGS="--model_name $MODEL \
     --learning_rate 1e-5 \
-    --use_refusal_vector True \
+    --use_refusal_vector False \
     --alpha 1.0 \
-    --voca_selection_mode 2 \
+    --voca_selection_mode 1 \
     --voca_selection_num 50 \
     --selection_method vote \
     --num_samples_per_prompt 8 \
@@ -41,9 +41,9 @@ COMMON_ARGS="--model_name $MODEL \
     --exclude_special_tokens True \
     --vote_top_k_inner 200 \
     --min_steered_prob 1e-6 \
-    --freeze_teacher False \
+    --freeze_teacher True \
     --update_refusal_vector True \
-    --freeze_safe_token False \
+    --freeze_safe_token True \
     --log_teacher_completions True"
 
 GPU_LIST=("0,1" "2,3")
@@ -58,7 +58,7 @@ run_pair () {
         --safe_token_horizon $H \
         --num_loss_tokens_to_keep $K \
         > "${LOG_DIR}/${TAG}.log" 2>&1 &
-    echo "  h=$H k=$K on GPU $GPUS (pid=$!)"
+    echo "  h=$H k=$K on GPU $GPUS (pid= $!)"
 }
 
 NUM_PAIRS=${#PAIRS[@]}

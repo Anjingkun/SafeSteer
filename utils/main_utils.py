@@ -199,81 +199,152 @@ def load_safety_dataset(seed=42, train_path=None, config=None) -> Dataset:
 
 def validate_training_arguments(args):
     """
-    Validates all runtime arguments for logical conflicts and mathematical boundaries.
-    Throws ValueError for fatal constraints and prints warnings for silent invalidations.
+    Validates all runtime arguments for logical conflicts and mathematical
+    boundaries. Mirrors the 4-case decision tree in DistilTrainer.__init__:
+
+        L1: use_refusal_vector
+            True  -> "vector" branch (RV steering)
+            False -> "prompt" branch (system-prompt steering)
+        L2: voca_selection_mode == 2  ->  whether safe_tokens are computed
+        L3: freeze_teacher            ->  whether dynamic refresh callbacks run
+
+    Four leaf cases:
+        (1) RV=True,  mode==2  : direction + safe_tokens
+        (2) RV=True,  mode!=2  : direction only
+        (3) RV=False, mode==2  : safe_tokens via system prompt
+        (4) RV=False, mode!=2  : nothing to steer (plain SFT-like)
+
+    Raises ValueError on hard conflicts; prints WARNINGs for arguments that
+    are silently ignored under the current configuration.
     """
-    # [1.1] Math & Boundary Checks (Fatal Errors)
+    # ----- [0] Universal sanity checks (apply to every case) -----------
     if not (0.0 <= args.alpha <= 1.0):
         raise ValueError(f"alpha must be between 0.0 and 1.0. Got: {args.alpha}")
-        
+
+    if args.num_loss_tokens_to_skip < 0:
+        raise ValueError(f"num_loss_tokens_to_skip must be >= 0. Got: {args.num_loss_tokens_to_skip}")
+    if args.num_loss_tokens_to_keep < 0:
+        raise ValueError(f"num_loss_tokens_to_keep must be >= 0. Got: {args.num_loss_tokens_to_keep}")
     if args.num_loss_tokens_to_keep > 0 and args.num_loss_tokens_to_keep <= args.num_loss_tokens_to_skip:
-        raise ValueError(f"num_loss_tokens_to_keep ({args.num_loss_tokens_to_keep}) " 
-                         f"must be strictly larger than num_loss_tokens_to_skip ({args.num_loss_tokens_to_skip}).")
+        raise ValueError(
+            f"num_loss_tokens_to_keep ({args.num_loss_tokens_to_keep}) must be strictly "
+            f"larger than num_loss_tokens_to_skip ({args.num_loss_tokens_to_skip})."
+        )
 
     if args.voca_selection_mode not in [0, 1, 2]:
-        raise ValueError(f"voca_selection_mode must be exactly 0, 1, or 2. Got: {args.voca_selection_mode}")
+        raise ValueError(f"voca_selection_mode must be 0, 1, or 2. Got: {args.voca_selection_mode}")
 
-    # [1.2] Warnings for useless Teacher parameters (Silent Invalidation)
-    if args.freeze_teacher:
-        print("\n[WARNING] Teacher is frozen (--freeze_teacher=True).")
-        print("          -> --ref_model_mixup_alpha is ignored.")
-        print("          -> --freeze_safe_token is ignored (safe tokens are implicitly frozen).")
-        if not args.use_refusal_vector:
-            print("          -> --update_refusal_vector is ignored.")
-            
-    if not args.use_refusal_vector and args.update_refusal_vector:
-        print("\n[WARNING] Not using refusal vector (--use_refusal_vector=False).")
-        print("          -> --update_refusal_vector is ignored.")
+    # ----- L1 dispatch --------------------------------------------------
+    if args.use_refusal_vector:
+        # =====================================================================
+        # RV branch (use_refusal_vector=True)
+        # =====================================================================
+        if args.voca_selection_mode == 2:
+            # ----- Case (1): RV + mode==2 ---------------------------------
+            print("\n[Case 1] RV steering + safe_tokens (use_refusal_vector=True, voca_selection_mode=2)")
+            _validate_mode2_params(args)
+            if args.freeze_teacher:
+                print("[WARNING] Teacher is frozen (--freeze_teacher=True).")
+                print("          -> --ref_model_mixup_alpha is ignored.")
+                print("          -> --update_refusal_vector is ignored (no callback registered).")
+                print("          -> --freeze_safe_token is ignored (safe_tokens are implicitly frozen).")
+        else:
+            # ----- Case (2): RV + mode!=2 ---------------------------------
+            print(f"\n[Case 2] RV steering only (use_refusal_vector=True, voca_selection_mode={args.voca_selection_mode})")
+            if args.voca_selection_mode == 1:
+                if args.voca_selection_num is None or args.voca_selection_num <= 0:
+                    raise ValueError(f"Mode 1 requires voca_selection_num > 0. Got: {args.voca_selection_num}")
+            else:  # mode == 0
+                print("[WARNING] Mode 0 (full vocab): --voca_selection_num and --renormalize_selected_tokens are ignored.")
+            print("[WARNING] Mode!=2 exclusive parameters (selection_method, num_samples_per_prompt, "
+                  "safe_token_*, vote_top_k_inner, exclude_special_tokens, min_steered_prob, "
+                  "safe_token_horizon, freeze_safe_token) are all ignored.")
+            if args.freeze_teacher:
+                print("[WARNING] Teacher is frozen (--freeze_teacher=True).")
+                print("          -> --ref_model_mixup_alpha is ignored.")
+                print("          -> --update_refusal_vector is ignored (no callback registered).")
+    else:
+        # =====================================================================
+        # Prompt branch (use_refusal_vector=False)
+        # =====================================================================
+        # --update_refusal_vector is structurally meaningless without RV
+        if args.update_refusal_vector:
+            print("\n[WARNING] use_refusal_vector=False → --update_refusal_vector is ignored "
+                  "(no refusal direction exists).")
 
-    # [1.3] Vocabulary Selection Modes Isolation
-    
-    # --- MODE 0 ---
-    if args.voca_selection_mode == 0:
-        print("\n[WARNING] Mode 0 (Full Vocab): --voca_selection_num, --renormalize_selected_tokens, "
-              "and all Mode 2 exclusive parameters are completely ignored.")
+        if args.voca_selection_mode == 2:
+            # ----- Case (3): prompt + mode==2 -----------------------------
+            print(f"\n[Case 3] Prompt steering + safe_tokens (use_refusal_vector=False, voca_selection_mode=2)")
+            _validate_mode2_params(args)
+            if args.freeze_teacher:
+                print("[WARNING] Teacher is frozen (--freeze_teacher=True).")
+                print("          -> --ref_model_mixup_alpha is ignored.")
+                print("          -> --freeze_safe_token is ignored (safe_tokens are implicitly frozen).")
+        else:
+            # ----- Case (4): prompt + mode!=2 -----------------------------
+            print(f"\n[Case 4] Prompt steering only (use_refusal_vector=False, voca_selection_mode={args.voca_selection_mode})")
+            if args.voca_selection_mode == 1:
+                if args.voca_selection_num is None or args.voca_selection_num <= 0:
+                    raise ValueError(f"Mode 1 requires voca_selection_num > 0. Got: {args.voca_selection_num}")
+            else:  # mode == 0
+                print("[WARNING] Mode 0 (full vocab): --voca_selection_num and --renormalize_selected_tokens are ignored.")
+            print("[WARNING] Mode!=2 exclusive parameters (selection_method, num_samples_per_prompt, "
+                  "safe_token_*, vote_top_k_inner, exclude_special_tokens, min_steered_prob, "
+                  "safe_token_horizon, freeze_safe_token) are all ignored.")
+            if args.freeze_teacher:
+                print("[WARNING] Teacher is frozen (--freeze_teacher=True).")
+                print("          -> --ref_model_mixup_alpha is ignored.")
 
-    # --- MODE 1 ---
-    elif args.voca_selection_mode == 1:
-        if args.voca_selection_num is None or args.voca_selection_num <= 0:
-            raise ValueError(f"Fatal: voca_selection_num must be > 0 for Mode 1. Got: {args.voca_selection_num}")
-        print("\n[WARNING] Mode 1 (Top-K): All Mode 2 exclusive parameters (e.g., min_steered_prob, "
-              "selection_method, num_samples_per_prompt) are completely ignored.")
 
-    # --- MODE 2 ---
-    elif args.voca_selection_mode == 2:
-        # Base Requirements
-        if args.voca_selection_num is None or args.voca_selection_num <= 0:
-            raise ValueError(f"Fatal: voca_selection_num must be > 0 for Mode 2. Got: {args.voca_selection_num}")
-        if not (0.0 <= args.min_steered_prob <= 1.0):
-            raise ValueError(f"Fatal: min_steered_prob must be between 0.0 and 1.0. Got: {args.min_steered_prob}")
+def _validate_mode2_params(args):
+    """Shared Mode-2 (safe-token selection) parameter validation. Used by
+    Case (1) and Case (3) in `validate_training_arguments`."""
+    if args.voca_selection_num is None or args.voca_selection_num <= 0:
+        raise ValueError(f"Mode 2 requires voca_selection_num > 0. Got: {args.voca_selection_num}")
+    if not (0.0 <= args.min_steered_prob <= 1.0):
+        raise ValueError(f"min_steered_prob must be in [0.0, 1.0]. Got: {args.min_steered_prob}")
+    if args.safe_token_horizon <= 0:
+        raise ValueError(f"safe_token_horizon must be > 0. Got: {args.safe_token_horizon}")
 
-        # Method Specifics: Vote vs Mean
-        if args.selection_method == "vote":
-            if args.num_samples_per_prompt <= 0:
-                raise ValueError("Fatal: 'vote' selection method requires --num_samples_per_prompt > 0.")
-            if args.vote_top_k_inner <= 0:
-                raise ValueError("Fatal: 'vote' selection method requires --vote_top_k_inner > 0.")
-        elif args.selection_method == "mean":
-            print("\n[WARNING] Mode 2 using 'mean': --vote_top_k_inner is ignored.")
+    # Selection method specifics
+    if args.selection_method == "vote":
+        if args.num_samples_per_prompt <= 0:
+            raise ValueError("'vote' selection requires --num_samples_per_prompt > 0.")
+        if args.vote_top_k_inner <= 0:
+            raise ValueError("'vote' selection requires --vote_top_k_inner > 0.")
+    elif args.selection_method == "mean":
+        print("[WARNING] selection_method='mean' → --vote_top_k_inner is ignored.")
+    else:
+        raise ValueError(f"selection_method must be 'mean' or 'vote'. Got: {args.selection_method}")
 
-        # Sampling Specifics: Single vs Multi
-        if args.num_samples_per_prompt > 1:
-            if args.safe_token_temperature <= 0.0:
-                raise ValueError("Fatal: Multi-sampling (num_samples_per_prompt > 1) requires "
-                                 "--safe_token_temperature > 0.0 to generate diverse trajectories.")
-            if not (0.0 < args.safe_token_top_p <= 1.0):
-                raise ValueError(f"Fatal: safe_token_top_p must be strictly greater than 0.0 and less than or equal to 1.0. "
-                                 f"Got: {args.safe_token_top_p}")
-        elif args.num_samples_per_prompt == 1:
-            print("\n[WARNING] Mode 2 using 1 sample: --safe_token_temperature and --safe_token_top_p are ignored.")
+    # Sampling specifics
+    if args.num_samples_per_prompt > 1:
+        if args.safe_token_temperature <= 0.0:
+            raise ValueError("Multi-sampling (num_samples_per_prompt > 1) requires safe_token_temperature > 0.0.")
+        if not (0.0 < args.safe_token_top_p <= 1.0):
+            raise ValueError(f"safe_token_top_p must be in (0.0, 1.0]. Got: {args.safe_token_top_p}")
+    else:
+        print("[WARNING] num_samples_per_prompt=1 → --safe_token_temperature and --safe_token_top_p are ignored.")
 
 def construct_output_dir(args, project_root):
     """
-    Constructs and creates the appropriate output directory path based on the training configuration.
-    Dynamically includes or excludes tags based on active parameters to keep folder names clean.
-    
-    Returns:
-        str: The absolute path to the finalized output directory.
+    Constructs a unique output directory name reflecting the training config.
+    Follows the 4-case decision tree in DistilTrainer.__init__:
+
+        (1) RV=True,  mode==2  : vector{RV_upd}-mode2-top{N}-horizon{H}{select}{ST_upd}{renorm}
+        (2) RV=True,  mode!=2  : vector{RV_upd}-mode{0|1}[-top{N}][{renorm}]
+        (3) RV=False, mode==2  : prompt{V}-mode2-top{N}-horizon{H}{select}{ST_upd}{renorm}
+        (4) RV=False, mode!=2  : prompt{V}-mode{0|1}[-top{N}][{renorm}]
+
+    Tags only appear when they actually affect runtime behavior:
+      - {RV_upd}  : only when not freeze_teacher (else RV cannot refresh)
+      - {ST_upd}  : only when not freeze_teacher (else safe_tokens cannot refresh)
+      - {frozenT} : only when freeze_teacher (global modifier on case_tag)
+      - {select}  : selection_method-specific params (T/Tp only if multi-sample,
+                    Vk only if vote)
+
+    Final layout:
+        {root}/{model}-{case_tag}{frozenT}-alpha{α}-{loss_tag}-{data}
     """
     # If the user explicitly provided an output directory, just use it directly
     if args.output_dir is not None:
@@ -282,65 +353,101 @@ def construct_output_dir(args, project_root):
 
     model_base = os.path.basename(args.model_name)
     data_base = os.path.basename(args.train_path).split('.')[0]
-    
-    # [1] Base keep tag for loss tokens
-    keep_tag = f"keep{args.num_loss_tokens_to_keep}"
-    if args.freeze_teacher:
-        keep_tag = f"{keep_tag}-frozenT"
-        
     root = os.path.join(project_root, "model_weights")
 
-    # [2] Method tag: strictly binds update_refusal_vector to use_refusal_vector
+    # ----- Global loss-token tag (skip + keep, both reflected) ----------
+    if args.num_loss_tokens_to_skip > 0:
+        loss_tag = f"skip{args.num_loss_tokens_to_skip}-keep{args.num_loss_tokens_to_keep}"
+    else:
+        loss_tag = f"keep{args.num_loss_tokens_to_keep}"
+    # Prepend learning rate so LR sweeps don't collide on the same dir.
+    loss_tag = f"lr{args.learning_rate}-{loss_tag}"
+
+    # ----- Global teacher-freeze tag (modifier on case_tag) -------------
+    # When frozen: just mark as frozen (EMA alpha is ignored at runtime).
+    # When synced: include EMA alpha so sweeps over it don't collide.
+    if args.freeze_teacher:
+        teacher_tag = "-frozenT"
+    else:
+        teacher_tag = f"-emaA{args.ref_model_mixup_alpha}"
+
+    # ----- Per-case tag construction (mirrors trainer's decision tree) --
     if args.use_refusal_vector:
-        upd_tag = "-updRV" if args.update_refusal_vector else "-fixRV"
-        method_tag = f"vector{upd_tag}"
-    else:
-        method_tag = "prompt"
-    
-    # [3] Mode 0 (Full Vocab Baseline)
-    if args.voca_selection_mode == 0:
-        final_dir = f"{root}/{model_base}-{method_tag}-mode0-alpha{args.alpha}-{keep_tag}-{data_base}"
-        
-    # [4] Mode 1 (Top-K Selection)
-    elif args.voca_selection_mode == 1:
-        renorm_tag = "-renorm" if args.renormalize_selected_tokens else ""
-        final_dir = (
-            f"{root}/{model_base}-{method_tag}-mode{args.voca_selection_mode}"
-            f"-top{args.voca_selection_num}-alpha{args.alpha}-{keep_tag}{renorm_tag}-{data_base}"
-        )
-        
-    # [5] Mode 2 (Advanced Safe-Token Filtering)
-    elif args.voca_selection_mode == 2:
-        select_tag = (
-            f"-{args.selection_method}"
-            f"-samples{args.num_samples_per_prompt}"
-            f"-excl{int(args.exclude_special_tokens)}"
-            f"-minP{args.min_steered_prob}"
-        )
-        
-        # Dynamically inject sampling parameters only if multi-sampling is active
-        if args.num_samples_per_prompt > 1:
-            select_tag += f"-T{args.safe_token_temperature}-Tp{args.safe_token_top_p}"
-            
-        # Dynamically inject vote parameters only if voting is active
-        if args.selection_method == "vote":
-            select_tag += f"-Vk{args.vote_top_k_inner}"
-
-        # Safe Token Update Tag ONLY if the teacher is actually capable of updating
+        # RV branch: refresh tag exists only when teacher can be synced.
+        rv_upd_tag = ""
         if not args.freeze_teacher:
-            st_tag = "-fixST" if args.freeze_safe_token else "-updST"
-            select_tag += st_tag
-            
-        renorm_tag = "-renorm" if args.renormalize_selected_tokens else ""
-        
-        final_dir = (
-            f"{root}/{model_base}-{method_tag}-mode{args.voca_selection_mode}"
-            f"-top{args.voca_selection_num}-horizon{args.safe_token_horizon}"
-            f"-alpha{args.alpha}-{keep_tag}{select_tag}{renorm_tag}-{data_base}"
-        )
-    else:
-        raise ValueError(f"Unexpected voca_selection_mode: {args.voca_selection_mode}")
+            rv_upd_tag = "-updRV" if args.update_refusal_vector else "-fixRV"
 
-    # Ensure the generated path exists
+        if args.voca_selection_mode == 2:
+            # ----- Case (1): RV + mode==2 -----------------------------
+            case_tag = (
+                f"vector{rv_upd_tag}-mode2"
+                f"-top{args.voca_selection_num}"
+                f"-horizon{args.safe_token_horizon}"
+                f"{_build_select_tag(args)}"
+                f"{_build_st_upd_tag(args)}"
+                f"{_build_renorm_tag(args)}"
+            )
+        else:
+            # ----- Case (2): RV + mode!=2 -----------------------------
+            case_tag = f"vector{rv_upd_tag}-mode{args.voca_selection_mode}"
+            if args.voca_selection_mode == 1:
+                case_tag += f"-top{args.voca_selection_num}{_build_renorm_tag(args)}"
+    else:
+        # Prompt branch: system-prompt steering (no refusal direction).
+        prompt_tag = "prompt"
+
+        if args.voca_selection_mode == 2:
+            # ----- Case (3): prompt + mode==2 -------------------------
+            case_tag = (
+                f"{prompt_tag}-mode2"
+                f"-top{args.voca_selection_num}"
+                f"-horizon{args.safe_token_horizon}"
+                f"{_build_select_tag(args)}"
+                f"{_build_st_upd_tag(args)}"
+                f"{_build_renorm_tag(args)}"
+            )
+        else:
+            # ----- Case (4): prompt + mode!=2 -------------------------
+            case_tag = f"{prompt_tag}-mode{args.voca_selection_mode}"
+            if args.voca_selection_mode == 1:
+                case_tag += f"-top{args.voca_selection_num}{_build_renorm_tag(args)}"
+
+    # ----- Assemble final path -----------------------------------------
+    # Seed is appended last so multi-seed reproducibility sweeps don't collide.
+    final_dir = (
+        f"{root}/{model_base}-{case_tag}{teacher_tag}"
+        f"-alpha{args.alpha}-{loss_tag}-{data_base}-seed{args.seed}"
+    )
     os.makedirs(final_dir, exist_ok=True)
     return final_dir
+
+
+def _build_select_tag(args):
+    """Mode-2 selection-method tag. Method-specific sampling/vote knobs are
+    appended here; the top-K count itself stays in the case_tag."""
+    select_tag = (
+        f"-{args.selection_method}"
+        f"-samples{args.num_samples_per_prompt}"
+        f"-excl{int(args.exclude_special_tokens)}"
+        f"-minP{args.min_steered_prob}"
+    )
+    # Sampling-only knobs (effective only when num_samples_per_prompt > 1).
+    if args.num_samples_per_prompt > 1:
+        select_tag += f"-T{args.safe_token_temperature}-Tp{args.safe_token_top_p}"
+    # Vote-only knob.
+    if args.selection_method == "vote":
+        select_tag += f"-Vk{args.vote_top_k_inner}"
+    return select_tag
+
+
+def _build_st_upd_tag(args):
+    """Safe-token refresh tag, present only when teacher is not frozen."""
+    if args.freeze_teacher:
+        return ""
+    return "-fixST" if args.freeze_safe_token else "-updST"
+
+
+def _build_renorm_tag(args):
+    """Local-renormalization tag (mode 1 and mode 2 only)."""
+    return "-renorm" if args.renormalize_selected_tokens else ""

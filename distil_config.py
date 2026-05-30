@@ -621,7 +621,7 @@ class DistilConfig(TrainingArguments):
     safe_system_prompt: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Safety system prompt text for the prompt-based safe-token selection (mode=2 + use_refusal_vector=False). Set automatically by main_myself.py from --prompt_version (V1/V2)."
+            "help": "Safety system prompt text for the prompt-based safe-token selection (mode=2 + use_refusal_vector=False)."
         }
     )
 
