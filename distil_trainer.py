@@ -102,6 +102,7 @@ def _dump_safe_tokens_trace(output_dir, step, horizon, token_ids, scores, tokeni
             "prob_baseline": pb,
             "prob_steered": ps,
         }
+        print(f"[safe_tokens_trace] Step {step}, horizon {horizon}: \nsafe_token_ids={ids} \ntokens={decoded} \nscores={sc} \nprob_baseline={pb} \nprob_steered={ps}")    
         path = os.path.join(output_dir, "safe_tokens_trace.jsonl")
         os.makedirs(output_dir, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
@@ -808,6 +809,8 @@ class DistilTrainer(BaseTrainer):
             # Shared setup for cases (1) and (2): datasets + model_base + direction.
             # ================================================================
             with torch.no_grad():
+                if self.accelerator.is_main_process:
+                    print("🔄 Generating initial refusal vector using the reference model as Teacher...")
                 harmful_train, harmless_train, harmful_val, harmless_val = \
                     self.load_and_sample_datasets_for_refusal_direction(args.seed)
                 unwrapped_ref_model = self.accelerator.unwrap_model(self.ref_model)
@@ -828,12 +831,13 @@ class DistilTrainer(BaseTrainer):
                         candidate_directions,
                         os.path.join(step_artifact_dir, "generate_directions/mean_diffs.pt"),
                     )
-                    print(f"SafeSteer✅ Initial refusal vector generated. Saved to {step_artifact_dir}")
                 pos, layer, direction = select_and_save_direction(
                     model_base, harmful_val_filted, harmless_val_filted,
                     candidate_directions, step_artifact_dir,
                     is_main_process=self.accelerator.is_main_process,
                 )
+                if self.accelerator.is_main_process:
+                    print(f"SafeSteer✅ Initial refusal vector generated. Saved to {step_artifact_dir}")
                 torch.cuda.empty_cache()
 
             # refusal_state always has "safe_tokens"; filled below if mode==2.
@@ -860,6 +864,8 @@ class DistilTrainer(BaseTrainer):
                 # injection is not stacked on top of the hook's injection.
                 self.refusal_state["is_active"] = False
                 with torch.no_grad():
+                    if self.accelerator.is_main_process:
+                        print("🔄 Generating initial safe_tokens via refusal-vector-steered Teacher...")
                     _M = self.args.num_samples_per_prompt
                     safe_token_ids, safe_token_scores, safe_prob_baseline, safe_prob_steered = get_safe_tokens(
                         model_base=model_base,
@@ -897,6 +903,8 @@ class DistilTrainer(BaseTrainer):
                     self.add_callback(MemoryEfficientSyncRefModelCallback(
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
+                    if self.accelerator.is_main_process:
+                            print("SafeSteer✅  Registered reference model synchronization callback.")
                     if self.args.update_refusal_vector:
                         self.add_callback(DynamicRefusalVectorCallback(
                             trainer=self,
@@ -904,7 +912,7 @@ class DistilTrainer(BaseTrainer):
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
                         if self.accelerator.is_main_process:
-                            print("⏸️  Registered dynamic update-refusal-vector callback.")
+                            print("SafeSteer✅  Registered dynamic update-refusal-vector callback.")
                     elif self.accelerator.is_main_process:
                         print("⏸️  update_refusal_vector=False → direction frozen at init.")
                     if not self.args.freeze_safe_token:
@@ -914,9 +922,11 @@ class DistilTrainer(BaseTrainer):
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
                         if self.accelerator.is_main_process:
-                            print("🔁 Registered dynamic safe-token callback (refusal-vector).")
+                            print("SafeSteer✅ Registered dynamic safe-token callback (refusal-vector).")
                     elif self.accelerator.is_main_process:
                         print("⏸️  freeze_safe_token=True → safe_tokens frozen at init.")
+                elif self.accelerator.is_main_process:
+                    print("⏸️  sync_ref_model=False → no dynamic refresh callbacks registered.")
             else:
                 # ============================================================
                 # Case (2): use_refusal_vector=True, mode!=2
@@ -932,8 +942,12 @@ class DistilTrainer(BaseTrainer):
                             harmful_train=harmful_train, harmless_train=harmless_train,
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
+                        if self.accelerator.is_main_process:
+                            print("SafeSteer✅  Registered dynamic update-refusal-vector callback.")
                     elif self.accelerator.is_main_process:
                         print("⏸️  update_refusal_vector=False → direction frozen at init.")
+                elif self.accelerator.is_main_process:
+                    print("⏸️  sync_ref_model=False → no dynamic refresh callbacks registered.")
 
         else:
             # ================================================================
@@ -995,6 +1009,8 @@ class DistilTrainer(BaseTrainer):
                     self.add_callback(MemoryEfficientSyncRefModelCallback(
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
+                    if self.accelerator.is_main_process:
+                            print("SafeSteer✅  Registered reference model synchronization callback.")
                     if not self.args.freeze_safe_token:
                         self.add_callback(DynamicSafeTokenViaSystemPromptCallback(
                             trainer=self,
@@ -1002,7 +1018,11 @@ class DistilTrainer(BaseTrainer):
                             harmful_val=harmful_val, harmless_val=harmless_val,
                         ))
                         if self.accelerator.is_main_process:
-                            print("🔁 Registered dynamic safe-token callback (system-prompt).")
+                            print("SafeSteer✅ Registered dynamic safe-token callback (system-prompt).")
+                    elif self.accelerator.is_main_process:
+                        print("⏸️  update_refusal_vector=False → direction frozen at init.")
+                elif self.accelerator.is_main_process:
+                    print("⏸️  sync_ref_model=False → no dynamic refresh callbacks registered.")
             else:
                 # ============================================================
                 # Case (4): use_refusal_vector=False, mode!=2
@@ -1014,6 +1034,10 @@ class DistilTrainer(BaseTrainer):
                     self.add_callback(MemoryEfficientSyncRefModelCallback(
                         ref_model=self.ref_model, accelerator=self.accelerator,
                     ))
+                    if self.accelerator.is_main_process:
+                        print("SafeSteer✅  Registered reference model synchronization callback.")
+                elif self.accelerator.is_main_process:
+                    print("⏸️  sync_ref_model=False → no dynamic refresh callbacks registered.")
 
     def _attach_teacher_actadd_hook(self):
         """Register a forward-pre-hook on the Teacher that adds
@@ -1968,7 +1992,6 @@ class DistilTrainer(BaseTrainer):
 
         if images is not None:
             self._logs["images"].extend(gather_object(images))
-
 
         # ----- 8. Build output dict ----------------------------------------
         # Keys here are exactly what `_compute_loss` reads downstream.

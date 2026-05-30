@@ -39,8 +39,12 @@ COMMON_ARGS="--model_name $MODEL \
     --safe_token_temperature 1.0 \
     --safe_token_top_p 1.0 \
     --exclude_special_tokens True \
-    --vote_top_k_inner 200" \
-    --
+    --vote_top_k_inner 200 \
+    --min_steered_prob 1e-6 \
+    --freeze_teacher False \
+    --update_refusal_vector True \
+    --freeze_safe_token False \
+    --log_teacher_completions True"
 
 GPU_LIST=("0,1" "2,3")
 
