@@ -1,70 +1,49 @@
 #!/bin/bash
-# One-shot installer: bash scripts/set.sh
-# Creates / updates the `distillation` conda env and patches TRL.
+# =============================================================================
+# SafeSteer environment installer.
+#
+#   bash scripts/setup.sh [env_name]
+#
+# env_name defaults to `safesteer`. If a conda env with that name already
+# exists, the script aborts (it will NOT touch an existing env) -- pick a
+# different name or remove the old one first.
+#
+# Installs all Python dependencies from requirements.txt and patches TRL so
+# its `print_prompt_completions_sample` accepts the extra `completions_teacher`
+# column SafeSteer logs. PyTorch is assumed to be already installed.
+# =============================================================================
 set -e
+
+ENV_NAME="${1:-safesteer}"
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _PROJ_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-# ---------------- 模型下载 ----------------
-# Llama-Guard-4-12B 每次都下 (评测必需);
-# 训练用 base model 由 BASE_MODEL 选一个:
-#   Llama-3-8B-Instruct | Llama-3.1-8B-Instruct | Llama-3.2-3B-Instruct | Qwen3-8B | Qwen3-4B
-# 不需要时 BASE_MODEL=none 跳过。
-#   bash scripts/set.sh                                # 默认下 Meta-Llama-3-8B-Instruct
-#   BASE_MODEL=Qwen3-8B bash scripts/set.sh
-#   BASE_MODEL=none bash scripts/set.sh                # 只下 Llama Guard
-#   DOWNLOAD_DEST=/some/dir bash scripts/set.sh        # 换目标位置
-DOWNLOAD_DEST="${DOWNLOAD_DEST:-/opt/tiger/entry}"
-BASE_MODEL="${BASE_MODEL:-Llama-3-8B-Instruct}"
-HDFS_USER_BASE="hdfs://harunava/home/byte_malia_gcp_aiic/user/lihao.612"
-
-# 已知 base model 在 HDFS_USER_BASE 下的子目录名 (相对 HDFS_USER_BASE)
-declare -A BASE_MODEL_DIRS=(
-    [Llama-3-8B-Instruct]="Meta-Llama-3-8B-Instruct"
-    [Llama-3.1-8B-Instruct]="Llama-3.1-8B-Instruct"
-    [Llama-3.2-3B-Instruct]="Llama-3.2-3B-Instruct"
-    [Qwen3-8B]="Qwen3-8B"
-    [Qwen3-4B]="Qwen3-4B"
-)
-
-if [ "${BASE_MODEL}" = "none" ] || [ -z "${BASE_MODEL}" ]; then
-    BASE_SRC=""
-elif [ -n "${BASE_MODEL_DIRS[${BASE_MODEL}]+x}" ]; then
-    BASE_SRC="${HDFS_USER_BASE}/${BASE_MODEL_DIRS[${BASE_MODEL}]}"
-else
-    echo "[set.sh] ERROR: unknown BASE_MODEL=${BASE_MODEL}." \
-         "可选: ${!BASE_MODEL_DIRS[*]} | none"
+# ---------------- 1. conda env ----------------
+if conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
+    echo "[setup] ERROR: conda env '${ENV_NAME}' already exists. Please check it," >&2
+    echo "        remove it (conda env remove -n ${ENV_NAME}), or pick another name:" >&2
+    echo "          bash scripts/setup.sh <env_name>" >&2
     exit 1
 fi
+echo "[setup] creating conda env '${ENV_NAME}' (python 3.12)..."
+conda create -y -n "${ENV_NAME}" python=3.12
 
-# 待下载列表: 总是带 Llama-Guard-4-12B; 按需追加 base model
-DOWNLOAD_LIST=(
-    "Llama-Guard-4-12B|${HDFS_USER_BASE}/Llama-Guard-4-12B"
-)
-[ -n "${BASE_SRC}" ] && DOWNLOAD_LIST+=("${BASE_MODEL}|${BASE_SRC}")
+# Resolve the env's python without needing `conda activate` in a script.
+ENV_PREFIX="$(conda env list | awk -v n="${ENV_NAME}" '$1==n {print $NF}')"
+PY="${ENV_PREFIX}/bin/python"
+echo "[setup] using interpreter: ${PY}"
 
-mkdir -p "${DOWNLOAD_DEST}"
-for entry in "${DOWNLOAD_LIST[@]}"; do
-    name="${entry%%|*}"
-    src="${entry#*|}"
-    dst="${DOWNLOAD_DEST}/${name}"
-    if [ -d "${dst}" ] && [ -n "$(ls -A "${dst}" 2>/dev/null)" ]; then
-        echo "[set.sh] ${name} already at ${dst}, skipping."
-        continue
-    fi
-    echo "[set.sh] downloading ${name} → ${dst}"
-    hdfs dfs -get "${src}" "${dst}"
-    echo "[set.sh] ${name} done."
-done
-echo "[set.sh] installing requirements.txt..."
-pip install -r "${_PROJ_ROOT}/requirements.txt" --user
+# ---------------- 2. dependencies ----------------
+echo "[setup] installing dependencies from requirements.txt ..."
+${PY} -m pip install -r "${_PROJ_ROOT}/requirements.txt"
 
-echo "[set.sh] installing extras (jaxtyping)..."
-pip install jaxtyping --user
-
-echo "[set.sh] patching trl.trainer.utils.print_prompt_completions_sample..."
-python - <<'PY'
+# ---------------- 3. patch TRL ----------------
+# SafeSteer passes an extra `completions_teacher` column into TRL's
+# print_prompt_completions_sample; stock TRL doesn't accept it and would crash
+# on the first logging step. This adds the column in place (idempotent).
+echo "[setup] patching trl.trainer.utils.print_prompt_completions_sample ..."
+${PY} - <<'PY'
 import inspect, sys
 import trl.trainer.utils as u
 
@@ -129,4 +108,5 @@ with open(src_path, "w") as f:
 print(f"  patched {src_path}")
 PY
 
-echo "[set.sh] done."
+echo ""
+echo "[setup] done. Activate the env with:  conda activate ${ENV_NAME}"
