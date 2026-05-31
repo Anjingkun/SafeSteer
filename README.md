@@ -3,12 +3,12 @@
 <h3 align="center">Localized Distillation, Zero Alignment Tax — with SafeSteer </h3
 
 
-<p align="center">
+<div align="center">
   <a href="https://arxiv.org/abs/2506.04308"><img src="https://img.shields.io/badge/arXiv-2506.04308-b31b1b.svg?logo=arxiv" alt="arXiv"></a>
   &nbsp;
   <a href="https://zhoues.github.io/RoboRefer/"><img src="https://img.shields.io/badge/%F0%9F%8F%A0%20Project-Homepage-blue" alt="Project Homepage"></a>
   &nbsp;
-</p>
+</div>
 
 <div style="text-align: center; background-color: white;">
     <img src='./assets//pipeline.png' width=100% >
