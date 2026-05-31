@@ -103,9 +103,9 @@ Below is a summary of some key arguments used in our training scripts.
 <table>
   <thead>
     <tr>
-      <th>Argument</th>
-      <th>Default</th>
-      <th>Description</th>
+      <th width="30%">Argument</th>
+      <th width="10%">Default</th>
+      <th width="60%">Description</th>
     </tr>
   </thead>
   <tbody>
