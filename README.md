@@ -97,17 +97,62 @@ bash scripts/run_llama32_3b.sh    # For Llama-3.2-3B-Instruct
 
 Below is a summary of some key arguments used in our training scripts.
 
-| **Argument**                    | **Default** | **Description**                                              |
-| ------------------------------- | ----------- | ------------------------------------------------------------ |
-| `--use_refusal_vector`          | `True`      | `True` = Use refusal vector (activation steering); `False` = Use system prompt. |
-| `--update_refusal_vector`       | `True`      | Whether to synchronously update the refusal vector (only valid when RV is used and Teacher is not frozen). |
-| `--freeze_teacher`              | `False`     | Freezes the Teacher model (disables weight synchronization and vector updates). |
-| `--voca_selection_mode`         | `0`         | `0` = Full vocabulary, `1` = Top-K, `2` = Safe-token subset. |
-| `--voca_selection_num`          | `50`        | The K value for mode 1, or the size of the safe-token subset for mode 2. |
-| `--renormalize_selected_tokens` | `False`     | Whether to re-normalize probabilities locally within the selected token slice. |
-| `--safe_token_horizon`          | `1`         | (Mode 2 only) The response length used for safe-token selection. |
-| `--min_steered_prob`            | `1e-6`      | (Mode 2 only) The minimum probability threshold for safe-token selection. |
-| `--freeze_safe_token`           | `True`      | (Mode 2 only) Whether to freeze the extracted safe tokens (disables refreshing during training). |
+<table>
+  <thead>
+    <tr>
+      <th>Argument</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--use_refusal_vector</code></td>
+      <td><code>True</code></td>
+      <td><code>True</code> = Use refusal vector (activation steering); <code>False</code> = Use system prompt.</td>
+    </tr>
+    <tr>
+      <td><code>--update_refusal_vector</code></td>
+      <td><code>True</code></td>
+      <td>Whether to synchronously update the refusal vector (only valid when RV is used and Teacher is not frozen).</td>
+    </tr>
+    <tr>
+      <td><code>--freeze_teacher</code></td>
+      <td><code>False</code></td>
+      <td>Freezes the Teacher model (disables weight synchronization and vector updates).</td>
+    </tr>
+    <tr>
+      <td><code>--voca_selection_mode</code></td>
+      <td><code>0</code></td>
+      <td><code>0</code> = Full vocabulary, <code>1</code> = Top-K, <code>2</code> = Safe-token subset.</td>
+    </tr>
+    <tr>
+      <td><code>--voca_selection_num</code></td>
+      <td><code>50</code></td>
+      <td>The K value for mode 1, or the size of the safe-token subset for mode 2.</td>
+    </tr>
+    <tr>
+      <td><code>--renormalize_selected_tokens</code></td>
+      <td><code>False</code></td>
+      <td>Whether to re-normalize probabilities locally within the selected token slice.</td>
+    </tr>
+    <tr>
+      <td><code>--safe_token_horizon</code></td>
+      <td><code>1</code></td>
+      <td>(Mode 2 only) The response length used for safe-token selection.</td>
+    </tr>
+    <tr>
+      <td><code>--min_steered_prob</code></td>
+      <td><code>1e-6</code></td>
+      <td>(Mode 2 only) The minimum probability threshold for safe-token selection.</td>
+    </tr>
+    <tr>
+      <td><code>--freeze_safe_token</code></td>
+      <td><code>True</code></td>
+      <td>(Mode 2 only) Whether to freeze the extracted safe tokens (disables refreshing during training).</td>
+    </tr>
+  </tbody>
+</table>
 
 For a complete list of arguments and more detailed descriptions, please refer to [`utils/main_utils.py`](https://github.com/Anjingkun/SafeSteer/blob/main/utils/main_utils.py#L71) .
 
