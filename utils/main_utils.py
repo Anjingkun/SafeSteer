@@ -103,7 +103,7 @@ def parse_args(project_root):
     # -------------------------------------------------------------- #
     # 3. Teacher Model Steering & State
     # -------------------------------------------------------------- #
-    parser.add_argument("--freeze_teacher", type=str2bool, default=False,
+    parser.add_argument("--freeze_teacher", type=str2bool, default=True,
                         help="If True, fully freezes the Teacher (reference model) at its initial state. "
                              "This disables weight synchronization and prevents any mid-training refreshes of refusal directions or safe tokens.")
     parser.add_argument("--ref_model_mixup_alpha", type=float, default=0.01, 

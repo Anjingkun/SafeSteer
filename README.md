@@ -118,7 +118,7 @@ Below is a summary of some key arguments used in our training scripts.
     </tr>
     <tr>
       <td><code>--freeze_teacher</code></td>
-      <td><code>False</code></td>
+      <td><code>True</code></td>
       <td>Freezes the Teacher model (disables weight synchronization and vector updates).</td>
     </tr>
     <tr>
