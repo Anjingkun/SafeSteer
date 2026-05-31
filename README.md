@@ -15,7 +15,8 @@
 </div>
 
 
-<div style="background-color: #ffe4e6; border-left: 4px solid #dc2626; padding: 0.75em 1em; margin-top: 1em; color: #b91c1c; font-weight: bold; border-radius: 0.375em;">   ⚠️ Warning: This repository contains text that is offensive, harmful, or otherwise inappropriate in nature. </div>
+> [!WARNING]
+> This repository contains text that is offensive, harmful, or otherwise inappropriate in nature.
 
 This repository contains code and results accompanying the paper "SafeSteer: Localized On-Policy Distillation for Efficient Safety Alignment". In the spirit of scientific reproducibility, we provide code to reproduce the main results from the paper.
 
@@ -56,7 +57,8 @@ else:
     raise ValueError("DistilTrainer requires a reference model for self-distillation. Please provide one via the `ref_model` argument.")
 ```
 
-<div style="background-color: #ffe4e6; border-left: 4px solid #dc2626; padding: 0.75em 1em; margin-top: 1em; color: #b91c1c; font-weight: bold; border-radius: 0.375em;">   ⚠️ Warning: Even when utilizing an 80 GB GPU, training an 8B model under a single-device configuration is computationally infeasible. For single-GPU deployments, the maximum viable model scale is strictly constrained to architectures of approximately 4B parameters. </div>
+> [!WARNING]
+> Even when utilizing an 80 GB GPU, training an 8B model under a single-device configuration is computationally infeasible. For single-GPU deployments, the maximum viable model scale is strictly constrained to architectures of approximately 4B parameters. </div>
 
 ## 📊 Dataset Details
 
@@ -91,7 +93,8 @@ bash scripts/run_llama3_8b.sh     # For Llama-3-8B-Instruct
 bash scripts/run_llama32_3b.sh    # For Llama-3.2-3B-Instruct
 ```
 
-📝 **Note:** Our training scripts use Weights & Biases (WandB) for logging. You may need to log in to your account by running `wandb login` in your terminal before executing the scripts.
+> [!NOTE]
+> Our training scripts use Weights & Biases (WandB) for logging. You may need to log in to your account by running `wandb login` in your terminal before executing the scripts.
 
 ## ⚙️ Key Arguments
 
