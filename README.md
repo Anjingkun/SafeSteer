@@ -14,7 +14,6 @@
     <img src='./assets//pipeline.png' width=100% >
 </div>
 
-
 > [!WARNING]
 > This repository contains text that is offensive, harmful, or otherwise inappropriate in nature.
 
