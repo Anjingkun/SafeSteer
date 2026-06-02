@@ -172,10 +172,13 @@ If you have any questions about the code or the paper, feel free to email Jingku
 If you find SafeSteer useful for your research, please cite using this BibTeX:
 
 ```
-@article{an2026safesteer,
-  title={SafeSteer: Localized On-Policy Distillation for Efficient Safety Alignmen},
-  author={An, Jingkun and Li, Hao and Song Zijun},
-  journal={arXiv preprint},
-  year={2026}
+@misc{li2026safesteerlocalizedonpolicydistillation,
+      title={SafeSteer: Localized On-Policy Distillation for Efficient Safety Alignment}, 
+      author={Hao Li and Jingkun An and Zijun Song and Pengyu Zhu and Rui Li and Hao Wang and Wendi Feng and Yesheng Liu and Lijun Li and Jin-Ge Yao and Lei Sha},
+      year={2026},
+      eprint={2606.02530},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2606.02530}, 
 }
 ```
