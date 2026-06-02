@@ -4,7 +4,7 @@
 
 
 <div align="center">
-  <a href="https://arxiv.org/abs/2606.02530"><img src="https://img.shields.io/badge/arXiv-2506.04308-b31b1b.svg?logo=arxiv" alt="arXiv"></a>
+  <a href="https://arxiv.org/abs/2606.02530"><img src="https://img.shields.io/badge/arXiv-2606.02530-b31b1b.svg?logo=arxiv" alt="arXiv"></a>
   &nbsp;
   <a href="https://anjingkun.github.io/SafeSteer/"><img src="https://img.shields.io/badge/%F0%9F%8F%A0%20Project-Homepage-blue" alt="Project Homepage"></a>
   &nbsp;
