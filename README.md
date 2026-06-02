@@ -1,6 +1,6 @@
 <h1 align="center">🛡️ SafeSteer: Localized On-Policy Distillation for Efficient Safety Alignment</h1>
 
-<h3 align="center">Localized Distillation, Zero Alignment Tax — with SafeSteer </h3>
+<h3 align="center">Localized Distillation, Minimal Alignment Tax — with SafeSteer </h3>
 
 
 <div align="center">
